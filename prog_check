@@ -1,0 +1,85 @@
+import pandas as pd
+
+# -----------------------------
+# USER INPUTS
+# -----------------------------
+xlsx_path = "data_1.xlsx"
+dta_path  = "data_2.dta"
+
+id_col = "id"  # <-- change if your id column has a different name
+
+# Columns to keep from each file (must include the id column)
+list_1 = [id_col, "pred_2020", "pred_2021"]   # <-- edit to your actual column names in data_1
+list_2 = [id_col, "dummy_a", "dummy_b"]       # <-- edit to your actual column names in data_2
+
+# Merge behavior: "inner" keeps only ids in both; use "left" if you want all from data_1
+merge_how = "inner"
+
+
+# -----------------------------
+# 1) Load XLSX (data_1) + select columns in list_1
+# -----------------------------
+df1 = pd.read_excel(xlsx_path)
+
+missing_1 = [c for c in list_1 if c not in df1.columns]
+if missing_1:
+    raise KeyError(f"data_1 is missing columns: {missing_1}\nAvailable: {list(df1.columns)}")
+
+df1 = df1.loc[:, list_1].copy()
+
+# Optional: ensure id is clean integer-like (handles '1.0' etc.)
+df1[id_col] = pd.to_numeric(df1[id_col], errors="raise").astype("Int64")
+
+
+# -----------------------------
+# 2) Load DTA (data_2) + select columns in list_2
+#    - It's long; repeated rows per id should be identical for the dummy columns
+#    - Check that within each id, dummy values don't vary; then keep first row per id
+# -----------------------------
+df2 = pd.read_stata(dta_path)
+
+missing_2 = [c for c in list_2 if c not in df2.columns]
+if missing_2:
+    raise KeyError(f"data_2 is missing columns: {missing_2}\nAvailable: {list(df2.columns)}")
+
+df2 = df2.loc[:, list_2].copy()
+df2[id_col] = pd.to_numeric(df2[id_col], errors="raise").astype("Int64")
+
+dummy_cols = [c for c in list_2 if c != id_col]
+if not dummy_cols:
+    raise ValueError("list_2 must include at least one non-id column (your dummy variables).")
+
+# Check that repeated rows per id are identical for all dummy columns
+nunique_per_id = df2.groupby(id_col, dropna=False)[dummy_cols].nunique(dropna=False)
+bad_ids_mask = (nunique_per_id > 1).any(axis=1)
+
+if bad_ids_mask.any():
+    bad_ids = nunique_per_id.index[bad_ids_mask].tolist()
+    # show where it breaks for quick debugging
+    example_id = bad_ids[0]
+    example_rows = df2[df2[id_col] == example_id].sort_values(by=dummy_cols).head(20)
+    raise ValueError(
+        f"Found ids where dummy columns are NOT constant across repeated rows.\n"
+        f"Number of problematic ids: {len(bad_ids)}\n"
+        f"First problematic id: {example_id}\n"
+        f"Example rows for that id (first 20):\n{example_rows.to_string(index=False)}"
+    )
+
+# Keep first row per id (now safe because values are constant within id)
+df2 = df2.sort_values(id_col).drop_duplicates(subset=[id_col], keep="first").copy()
+
+
+# -----------------------------
+# 3) Merge on id
+# -----------------------------
+merged = df1.merge(df2, on=id_col, how=merge_how, validate="one_to_one")
+
+print("df1 shape:", df1.shape)
+print("df2 (deduped) shape:", df2.shape)
+print("merged shape:", merged.shape)
+
+# Optional: save
+# merged.to_excel("merged.xlsx", index=False)
+# merged.to_csv("merged.csv", index=False)
+
+merged.head()
