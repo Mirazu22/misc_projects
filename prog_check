@@ -1,85 +1,137 @@
+from __future__ import annotations
+
+from pathlib import Path
 import pandas as pd
+
 
 # -----------------------------
 # USER INPUTS
 # -----------------------------
-xlsx_path = "data_1.xlsx"
-dta_path  = "data_2.dta"
+base_dir_raw = r"C:\...\your\root\folder"  # use r"" for Windows paths with backslashes
 
-id_col = "id"  # <-- change if your id column has a different name
+start_year = 2015
+end_year   = 2020
 
-# Columns to keep from each file (must include the id column)
-list_1 = [id_col, "pred_2020", "pred_2021"]   # <-- edit to your actual column names in data_1
-list_2 = [id_col, "dummy_a", "dummy_b"]       # <-- edit to your actual column names in data_2
+id_col = "id"
 
-# Merge behavior: "inner" keeps only ids in both; use "left" if you want all from data_1
+# columns to keep
+pred_cols = ["pred_1", "pred_2"]        # <-- predictions in the XLSX (per year)
+dummy_cols = ["dummy_a", "dummy_b"]     # <-- dummies in the DTA (time-invariant within id, repeated in long file)
+
+# merge behavior
 merge_how = "inner"
 
 
 # -----------------------------
-# 1) Load XLSX (data_1) + select columns in list_1
+# PATH BUILDERS
+# each year:
+# ...\prediction_{year}\unemp\file_unemp_{year}.xlsx
+# and a matching dta file (adjust pattern to your real structure)
 # -----------------------------
-df1 = pd.read_excel(xlsx_path)
+base_dir = Path(base_dir_raw)
 
-missing_1 = [c for c in list_1 if c not in df1.columns]
-if missing_1:
-    raise KeyError(f"data_1 is missing columns: {missing_1}\nAvailable: {list(df1.columns)}")
+def xlsx_path_for_year(year: int) -> Path:
+    return base_dir / f"prediction_{year}" / "unemp" / f"file_unemp_{year}.xlsx"
 
-df1 = df1.loc[:, list_1].copy()
-
-# Optional: ensure id is clean integer-like (handles '1.0' etc.)
-df1[id_col] = pd.to_numeric(df1[id_col], errors="raise").astype("Int64")
+def dta_path_for_year(year: int) -> Path:
+    # If your .dta is NOT yearly, see the note below and change this accordingly.
+    return base_dir / f"prediction_{year}" / "unemp" / f"file_unemp_{year}.dta"
 
 
 # -----------------------------
-# 2) Load DTA (data_2) + select columns in list_2
-#    - It's long; repeated rows per id should be identical for the dummy columns
-#    - Check that within each id, dummy values don't vary; then keep first row per id
+# HELPERS
 # -----------------------------
-df2 = pd.read_stata(dta_path)
+def load_pred_xlsx(year: int) -> pd.DataFrame:
+    p = xlsx_path_for_year(year)
+    if not p.exists():
+        raise FileNotFoundError(f"Missing XLSX for year {year}: {p}")
 
-missing_2 = [c for c in list_2 if c not in df2.columns]
-if missing_2:
-    raise KeyError(f"data_2 is missing columns: {missing_2}\nAvailable: {list(df2.columns)}")
+    df = pd.read_excel(p)
 
-df2 = df2.loc[:, list_2].copy()
-df2[id_col] = pd.to_numeric(df2[id_col], errors="raise").astype("Int64")
+    needed = [id_col] + pred_cols
+    missing = [c for c in needed if c not in df.columns]
+    if missing:
+        raise KeyError(f"{p.name} is missing columns: {missing}\nAvailable: {list(df.columns)}")
 
-dummy_cols = [c for c in list_2 if c != id_col]
-if not dummy_cols:
-    raise ValueError("list_2 must include at least one non-id column (your dummy variables).")
+    df = df.loc[:, needed].copy()
+    df[id_col] = pd.to_numeric(df[id_col], errors="raise").astype("Int64")
 
-# Check that repeated rows per id are identical for all dummy columns
-nunique_per_id = df2.groupby(id_col, dropna=False)[dummy_cols].nunique(dropna=False)
-bad_ids_mask = (nunique_per_id > 1).any(axis=1)
+    # add year and make year-specific id
+    df["year"] = year
+    df["id_year"] = df[id_col].astype(str) + "_" + str(year)
 
-if bad_ids_mask.any():
-    bad_ids = nunique_per_id.index[bad_ids_mask].tolist()
-    # show where it breaks for quick debugging
-    example_id = bad_ids[0]
-    example_rows = df2[df2[id_col] == example_id].sort_values(by=dummy_cols).head(20)
-    raise ValueError(
-        f"Found ids where dummy columns are NOT constant across repeated rows.\n"
-        f"Number of problematic ids: {len(bad_ids)}\n"
-        f"First problematic id: {example_id}\n"
-        f"Example rows for that id (first 20):\n{example_rows.to_string(index=False)}"
+    return df
+
+
+def load_dummies_dta(year: int) -> pd.DataFrame:
+    p = dta_path_for_year(year)
+    if not p.exists():
+        raise FileNotFoundError(f"Missing DTA for year {year}: {p}")
+
+    df = pd.read_stata(p)
+
+    needed = [id_col] + dummy_cols
+    missing = [c for c in needed if c not in df.columns]
+    if missing:
+        raise KeyError(f"{p.name} is missing columns: {missing}\nAvailable: {list(df.columns)}")
+
+    df = df.loc[:, needed].copy()
+    df[id_col] = pd.to_numeric(df[id_col], errors="raise").astype("Int64")
+
+    # Check repeated rows per id are identical for dummy columns
+    nunique_per_id = df.groupby(id_col, dropna=False)[dummy_cols].nunique(dropna=False)
+    bad_ids_mask = (nunique_per_id > 1).any(axis=1)
+    if bad_ids_mask.any():
+        bad_ids = nunique_per_id.index[bad_ids_mask].tolist()
+        example_id = bad_ids[0]
+        example_rows = df[df[id_col] == example_id].head(20)
+        raise ValueError(
+            f"{p.name}: dummy columns vary within id for {len(bad_ids)} ids.\n"
+            f"First problematic id: {example_id}\n"
+            f"Example rows:\n{example_rows.to_string(index=False)}"
+        )
+
+    # Deduplicate to one row per id (time-invariant)
+    df = df.sort_values(id_col).drop_duplicates(subset=[id_col], keep="first").copy()
+
+    # Add year and year-specific id, AND year-suffix the dummy column names
+    df["year"] = year
+    df["id_year"] = df[id_col].astype(str) + "_" + str(year)
+
+    # Rename dummy columns to include year (you asked: dummies need year added)
+    df = df.rename(columns={c: f"{c}_{year}" for c in dummy_cols})
+
+    return df
+
+
+# -----------------------------
+# MAIN: loop years, merge per year, then concatenate to long list
+# -----------------------------
+frames: list[pd.DataFrame] = []
+
+for year in range(start_year, end_year + 1):
+    df_pred = load_pred_xlsx(year)
+    df_dum  = load_dummies_dta(year)
+
+    merged = df_pred.merge(
+        df_dum,
+        on=["id_year", "year"],   # year-specific key
+        how=merge_how,
+        validate="one_to_one"
     )
 
-# Keep first row per id (now safe because values are constant within id)
-df2 = df2.sort_values(id_col).drop_duplicates(subset=[id_col], keep="first").copy()
+    # If you want to drop the original id after creating id_year, uncomment:
+    # merged = merged.drop(columns=[id_col])
+
+    frames.append(merged)
+
+result_long = pd.concat(frames, ignore_index=True)
+
+print("Years:", start_year, "to", end_year)
+print("Result shape:", result_long.shape)
+print(result_long.head())
 
 
-# -----------------------------
-# 3) Merge on id
-# -----------------------------
-merged = df1.merge(df2, on=id_col, how=merge_how, validate="one_to_one")
-
-print("df1 shape:", df1.shape)
-print("df2 (deduped) shape:", df2.shape)
-print("merged shape:", merged.shape)
-
-# Optional: save
-# merged.to_excel("merged.xlsx", index=False)
-# merged.to_csv("merged.csv", index=False)
-
-merged.head()
+# Optional saves
+# out_xlsx = base_dir / f"merged_long_{start_year}_{end_year}.xlsx"
+# result_long.to_excel(out_xlsx, index=False)
