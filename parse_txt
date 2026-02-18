@@ -1,31 +1,31 @@
 import re
 import pandas as pd
 
-def parse_variable_16x1(path, enc="cp1252"):
+def parse_matlist_16x1(path, matname, enc="cp1252"):
     text = open(path, "r", encoding=enc, errors="strict").read()
     lines = text.splitlines()
 
-    cmd_re = re.compile(r"^\s*\.\s*mat\s+list\s+variable\b", re.IGNORECASE)
-    hdr_re = re.compile(r"\bvariable\[16,\s*1\]")
+    cmd_re = re.compile(rf"^\s*\.\s*mat\s+list\s+{re.escape(matname)}\b", re.IGNORECASE)
+    hdr_re = re.compile(rf"\b{re.escape(matname)}\[16,\s*1\]")
 
-    # 1) find ". mat list variable"
+    # 1) find ". mat list <matname>"
     i = next((idx for idx, ln in enumerate(lines) if cmd_re.search(ln)), None)
     if i is None:
-        raise ValueError("Could not find '. mat list variable' in file.")
+        raise ValueError(f"Could not find '. mat list {matname}' in file.")
 
-    # 2) find "variable[16,1]" after it
+    # 2) find "<matname>[16,1]" after it
     j = next((idx for idx in range(i, min(i + 120, len(lines))) if hdr_re.search(lines[idx])), None)
     if j is None:
-        raise ValueError("Found '. mat list variable' but not the 'variable[16,1]' block after it.")
+        raise ValueError(f"Found '. mat list {matname}' but not the '{matname}[16,1]' block after it.")
 
-    # 3) column name line (next non-empty line; last token is the col name)
+    # 3) column name line
     k = j + 1
     while k < len(lines) and not lines[k].strip():
         k += 1
     col = lines[k].split()[-1] if k < len(lines) and lines[k].split() else "value"
     k += 1
 
-    # 4) read 16 rows: "<rowname>   <number>"
+    # 4) read 16 rows
     rows, vals = [], []
     while k < len(lines) and len(rows) < 16:
         ln = lines[k].strip()
@@ -40,14 +40,14 @@ def parse_variable_16x1(path, enc="cp1252"):
         rows.append(row)
 
     if len(rows) != 16:
-        raise ValueError(f"Parsed {len(rows)} rows, expected 16. Layout differs from expected.")
+        raise ValueError(f"Parsed {len(rows)} rows, expected 16.")
 
     df = pd.DataFrame({col: vals}, index=rows)
     df.index.name = "region"
     return df
 
 
-# ---- example ----
+# --- usage ---
 path = r"/mnt/data/1188  mat list.txt"
-df = parse_variable_16x1(path, enc="cp1252")   # change encoding if needed
+df = parse_matlist_16x1(path, matname="variable", enc="cp1252")
 print(df)
