@@ -5,34 +5,46 @@ def parse_matlist_16x1(path, matname, enc="cp1252"):
     text = open(path, "r", encoding=enc, errors="strict").read()
     lines = text.splitlines()
 
-    cmd_re = re.compile(rf"^\s*\.\s*mat\s+list\s+{re.escape(matname)}\b", re.IGNORECASE)
-    hdr_re = re.compile(rf"\b{re.escape(matname)}\[16,\s*1\]")
+    # allow: "1188  . mat list variable" OR "1188  .mat list variable"
+    cmd_re = re.compile(
+        rf"^\s*(?:\d+\s+)?\.\s*mat\s+list\s+{re.escape(matname)}\b",
+        re.IGNORECASE
+    )
 
-    # 1) find ". mat list <matname>"
+    # allow: "variable[16,1]" anywhere on a later line
+    hdr_re = re.compile(rf"\b{re.escape(matname)}\s*\[16,\s*1\]", re.IGNORECASE)
+
+    # 1) find the command line
     i = next((idx for idx, ln in enumerate(lines) if cmd_re.search(ln)), None)
     if i is None:
-        raise ValueError(f"Could not find '. mat list {matname}' in file.")
+        # helpful debug: show close matches
+        candidates = [ln for ln in lines if ("mat list" in ln.lower() and matname.lower() in ln.lower())][:5]
+        raise ValueError(
+            f"Could not find '. mat list {matname}' in file.\n"
+            f"First few similar lines I saw:\n" + "\n".join(candidates)
+        )
 
-    # 2) find "<matname>[16,1]" after it
-    j = next((idx for idx in range(i, min(i + 120, len(lines))) if hdr_re.search(lines[idx])), None)
+    # 2) find header like "matname[16,1]" after it
+    j = next((idx for idx in range(i, min(i + 200, len(lines))) if hdr_re.search(lines[idx])), None)
     if j is None:
-        raise ValueError(f"Found '. mat list {matname}' but not the '{matname}[16,1]' block after it.")
+        raise ValueError(f"Found the command, but not '{matname}[16,1]' after it.")
 
-    # 3) column name line
+    # 3) column name line: next non-empty line; last token is column label (in your example: year)
     k = j + 1
     while k < len(lines) and not lines[k].strip():
         k += 1
     col = lines[k].split()[-1] if k < len(lines) and lines[k].split() else "value"
     k += 1
 
-    # 4) read 16 rows
+    # 4) parse 16 rows: "<rowname>   <number>"
     rows, vals = [], []
     while k < len(lines) and len(rows) < 16:
         ln = lines[k].strip()
         k += 1
         if not ln:
             continue
-        if ln.startswith("."):
+        # next Stata command (could also be "1234  . something")
+        if re.match(r"^\s*(?:\d+\s+)?\.", ln):
             break
 
         row, num = ln.rsplit(maxsplit=1)
