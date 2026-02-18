@@ -1,35 +1,48 @@
 import re
 import pandas as pd
 
+def parse_stata_int_de(s: str) -> int:
+    """
+    Parse Stata-printed integers that use '.' as thousands separator.
+    Examples: "180.000" -> 180000, "12" -> 12, "-1.234" -> -1234
+    """
+    s = s.replace("\xa0", "").strip()  # remove NBSP if present
+    s = s.replace(".", "")            # remove thousands separator
+    s = s.replace(",", "")            # just in case commas appear
+    return int(s)
+
 def parse_matlist_16x1(path, matname, enc="cp1252"):
     text = open(path, "r", encoding=enc, errors="strict").read()
     lines = text.splitlines()
 
-    # allow: "1188  . mat list variable" OR "1188  .mat list variable"
+    # allow optional line number and optional space after the dot:
+    # "1188  . mat list variable" OR "1188  .mat list variable"
     cmd_re = re.compile(
         rf"^\s*(?:\d+\s+)?\.\s*mat\s+list\s+{re.escape(matname)}\b",
         re.IGNORECASE
     )
 
-    # allow: "variable[16,1]" anywhere on a later line
+    # header like: variable[16,1] (allow spacing)
     hdr_re = re.compile(rf"\b{re.escape(matname)}\s*\[16,\s*1\]", re.IGNORECASE)
 
     # 1) find the command line
     i = next((idx for idx, ln in enumerate(lines) if cmd_re.search(ln)), None)
     if i is None:
-        # helpful debug: show close matches
-        candidates = [ln for ln in lines if ("mat list" in ln.lower() and matname.lower() in ln.lower())][:5]
+        candidates = [
+            ln for ln in lines
+            if ("mat" in ln.lower() and "list" in ln.lower() and matname.lower() in ln.lower())
+        ][:8]
         raise ValueError(
             f"Could not find '. mat list {matname}' in file.\n"
-            f"First few similar lines I saw:\n" + "\n".join(candidates)
+            f"First similar lines I saw:\n" + "\n".join(candidates)
         )
 
-    # 2) find header like "matname[16,1]" after it
+    # 2) find header line after it
     j = next((idx for idx in range(i, min(i + 200, len(lines))) if hdr_re.search(lines[idx])), None)
     if j is None:
         raise ValueError(f"Found the command, but not '{matname}[16,1]' after it.")
 
-    # 3) column name line: next non-empty line; last token is column label (in your example: year)
+    # 3) column name line: next non-empty line; last token is column label
     k = j + 1
     while k < len(lines) and not lines[k].strip():
         k += 1
@@ -41,14 +54,16 @@ def parse_matlist_16x1(path, matname, enc="cp1252"):
     while k < len(lines) and len(rows) < 16:
         ln = lines[k].strip()
         k += 1
+
         if not ln:
             continue
-        # next Stata command (could also be "1234  . something")
+
+        # next Stata command line: ". ..." or "1234  . ..."
         if re.match(r"^\s*(?:\d+\s+)?\.", ln):
             break
 
         row, num = ln.rsplit(maxsplit=1)
-        vals.append(float(num.replace(",", "")))
+        vals.append(parse_stata_int_de(num))
         rows.append(row)
 
     if len(rows) != 16:
@@ -59,7 +74,7 @@ def parse_matlist_16x1(path, matname, enc="cp1252"):
     return df
 
 
-# --- usage ---
+# ---- example usage ----
 path = r"/mnt/data/1188  mat list.txt"
-df = parse_matlist_16x1(path, matname="variable", enc="cp1252")
+df = parse_matlist_16x1(path, matname="variable", enc="cp1252")  # change enc if needed
 print(df)
