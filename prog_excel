@@ -1,0 +1,276 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional, Sequence, Dict, List, Tuple, Union
+
+import numpy as np
+import pandas as pd
+
+from openpyxl import load_workbook
+from openpyxl.styles import Font, Alignment, PatternFill
+from openpyxl.formatting.rule import ColorScaleRule
+from openpyxl.utils import get_column_letter
+
+
+@dataclass
+class ExportConfig:
+    # Absolute relative error: abs((f - y) / y)
+    add_conditional_formatting: bool = True
+
+    # Excel aesthetics
+    freeze_panes_cell: str = "B2"
+    header_fill_hex: str = "1F4E79"
+    header_font_color_hex: str = "FFFFFF"
+
+
+def _validate_columns(df: pd.DataFrame, cols: Sequence[str], label: str) -> None:
+    missing = [c for c in cols if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing {label} columns in df: {missing}")
+
+
+def _autosize_columns(ws, max_width: int = 55) -> None:
+    for col_idx in range(1, ws.max_column + 1):
+        col_letter = get_column_letter(col_idx)
+        max_len = 0
+        for row_idx in range(1, ws.max_row + 1):
+            v = ws.cell(row=row_idx, column=col_idx).value
+            if v is None:
+                continue
+            s = str(v)
+            max_len = max(max_len, len(s))
+        ws.column_dimensions[col_letter].width = min(max_len + 2, max_width)
+
+
+def _style_header(ws, header_fill_hex: str, header_font_color_hex: str) -> None:
+    fill = PatternFill("solid", fgColor=header_fill_hex)
+    font = Font(bold=True, color=header_font_color_hex)
+    align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    for cell in ws[1]:
+        cell.fill = fill
+        cell.font = font
+        cell.alignment = align
+    ws.row_dimensions[1].height = 22
+
+
+def _add_filters(ws) -> None:
+    ws.auto_filter.ref = ws.dimensions
+
+
+def _apply_percent_format(ws, col_indices: List[int]) -> None:
+    for col_idx in col_indices:
+        for row in range(2, ws.max_row + 1):
+            cell = ws.cell(row=row, column=col_idx)
+            if isinstance(cell.value, (int, float)) and cell.value is not None:
+                cell.number_format = "0.00%"
+
+
+def _add_conditional_formatting_errors(ws, error_col_indices: List[int]) -> None:
+    rule = ColorScaleRule(
+        start_type="percentile", start_value=10, start_color="63BE7B",
+        mid_type="percentile", mid_value=50, mid_color="FFEB84",
+        end_type="percentile", end_value=90, end_color="F8696B"
+    )
+    for col_idx in error_col_indices:
+        col_letter = get_column_letter(col_idx)
+        rng = f"{col_letter}2:{col_letter}{ws.max_row}"
+        ws.conditional_formatting.add(rng, rule)
+
+
+def export_forecast_diagnostics_to_excel(
+    df: pd.DataFrame,
+    output_path: Union[str, Path],
+    *,
+    id_col: str,
+    year_col: str,
+    year_id_col: str,
+    empirical_col: str,
+    forecast_cols: Sequence[str],
+    dummy_cols: Sequence[str],
+    fc_model_cols: Optional[Sequence[str]] = None,
+    config: Optional[ExportConfig] = None,
+) -> Tuple[Path, Dict[str, pd.DataFrame]]:
+    """
+    Assumptions (based on your answers):
+      - Relative error is absolute: abs((f - y) / y)
+      - empirical is never 0; can be NaN (meaning not observed yet)
+      - dummy NaNs should be ignored in averages (mean(skipna=True))
+      - unweighted averages over rows
+
+    Output sheets:
+      - data_with_errors
+      - summary_by_id
+      - usage_overall
+      - notes
+    """
+    if config is None:
+        config = ExportConfig()
+
+    output_path = Path(output_path)
+    use_fc_models = fc_model_cols is not None and len(fc_model_cols) > 0
+
+    _validate_columns(df, [id_col, year_col, year_id_col, empirical_col], "base required")
+    _validate_columns(df, list(forecast_cols), "forecast")
+    _validate_columns(df, list(dummy_cols), "dummy")
+    if use_fc_models:
+        _validate_columns(df, list(fc_model_cols), "fc_model")
+
+    out = df.copy()
+
+    # Denominator: empirical (never 0, but can be NaN)
+    denom = out[empirical_col].astype(float)
+
+    def abs_rel_err(f: pd.Series) -> pd.Series:
+        f = f.astype(float)
+        y = out[empirical_col].astype(float)
+        # If y is NaN -> result stays NaN automatically
+        return ((f - y) / denom).abs()
+
+    # --- Error columns for pooled forecasts
+    error_cols: List[str] = []
+    for c in forecast_cols:
+        new_c = f"rel_err__{c}"
+        out[new_c] = abs_rel_err(out[c])
+        error_cols.append(new_c)
+
+    # --- Optional error columns for individual models
+    model_error_cols: List[str] = []
+    if use_fc_models:
+        for c in fc_model_cols:  # type: ignore[arg-type]
+            new_c = f"rel_err__{c}"
+            out[new_c] = abs_rel_err(out[c])
+            model_error_cols.append(new_c)
+
+    # --- Summary: average relative errors per id
+    avg_err_by_id = (
+        out.groupby(id_col, dropna=False)[error_cols]
+        .mean(numeric_only=True)
+        .reset_index()
+    )
+    avg_err_by_id["avg_rel_err__forecasts"] = avg_err_by_id[error_cols].mean(axis=1, skipna=True)
+
+    if use_fc_models and model_error_cols:
+        avg_model_by_id = (
+            out.groupby(id_col, dropna=False)[model_error_cols]
+            .mean(numeric_only=True)
+            .reset_index()
+        )
+        avg_model_by_id["avg_rel_err__fc_models"] = avg_model_by_id[model_error_cols].mean(axis=1, skipna=True)
+        avg_err_by_id = avg_err_by_id.merge(avg_model_by_id, on=id_col, how="left")
+
+    # --- Dummy usage (NaNs ignored)
+    dummies = out[list(dummy_cols)].copy()
+    dummy_usage_by_id = (
+        pd.concat([out[[id_col]], dummies], axis=1)
+        .groupby(id_col, dropna=False)[list(dummy_cols)]
+        .mean(numeric_only=True)
+        .reset_index()
+    )
+    dummy_usage_by_id["avg_usage__all_models"] = dummy_usage_by_id[list(dummy_cols)].mean(axis=1, skipna=True)
+
+    summary_by_id = avg_err_by_id.merge(dummy_usage_by_id, on=id_col, how="left")
+
+    usage_overall = (
+        dummies.mean(numeric_only=True)  # skipna=True default
+        .to_frame("avg_usage")
+        .reset_index()
+        .rename(columns={"index": "dummy"})
+    )
+
+    notes = pd.DataFrame(
+        {
+            "item": [
+                "Relative error definition",
+                "Empirical NaN meaning",
+                "Dummy NA meaning",
+                "Averaging",
+                "Sheets",
+            ],
+            "value": [
+                "abs((forecast - empirical) / empirical)",
+                "No observed value yet => errors are NaN",
+                "Model/spec not available => ignored in usage means",
+                "Unweighted means over rows (skipna=True)",
+                "data_with_errors, summary_by_id, usage_overall, notes",
+            ],
+        }
+    )
+
+    # Column ordering: identifiers first, then original cols, then rel_err__* at end
+    id_cols = [id_col, year_col, year_id_col]
+    keep_first = [c for c in id_cols if c in out.columns]
+    remaining = [c for c in out.columns if c not in keep_first]
+    non_error = [c for c in remaining if not (isinstance(c, str) and c.startswith("rel_err__"))]
+    all_error = [c for c in remaining if isinstance(c, str) and c.startswith("rel_err__")]
+    out = out[keep_first + non_error + all_error]
+
+    # Write with pandas
+    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+        out.to_excel(writer, index=False, sheet_name="data_with_errors")
+        summary_by_id.to_excel(writer, index=False, sheet_name="summary_by_id")
+        usage_overall.to_excel(writer, index=False, sheet_name="usage_overall")
+        notes.to_excel(writer, index=False, sheet_name="notes")
+
+    # Post-format with openpyxl
+    wb = load_workbook(output_path)
+    for sheet_name in ["data_with_errors", "summary_by_id", "usage_overall", "notes"]:
+        ws = wb[sheet_name]
+        _style_header(ws, config.header_fill_hex, config.header_font_color_hex)
+        _add_filters(ws)
+        ws.freeze_panes = config.freeze_panes_cell
+        _autosize_columns(ws)
+
+        for row in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=1, max_col=ws.max_column):
+            for cell in row:
+                cell.alignment = Alignment(vertical="top", wrap_text=False)
+
+    # Percent formats + conditional formatting
+    ws_data = wb["data_with_errors"]
+    data_headers = [c.value for c in ws_data[1]]
+    data_error_cols = [i + 1 for i, h in enumerate(data_headers) if isinstance(h, str) and h.startswith("rel_err__")]
+    _apply_percent_format(ws_data, data_error_cols)
+
+    if config.add_conditional_formatting and data_error_cols:
+        _add_conditional_formatting_errors(ws_data, data_error_cols)
+
+    ws_sum = wb["summary_by_id"]
+    sum_headers = [c.value for c in ws_sum[1]]
+    sum_pct_cols = [
+        i + 1 for i, h in enumerate(sum_headers)
+        if isinstance(h, str) and (
+            h.startswith("rel_err__")
+            or h.startswith("avg_rel_err__")
+            or h.startswith("avg_usage__")
+            or h in set(dummy_cols)
+        )
+    ]
+    _apply_percent_format(ws_sum, sum_pct_cols)
+
+    ws_usage = wb["usage_overall"]
+    usage_headers = [c.value for c in ws_usage[1]]
+    if "avg_usage" in usage_headers:
+        _apply_percent_format(ws_usage, [usage_headers.index("avg_usage") + 1])
+
+    wb.save(output_path)
+
+    return output_path, {
+        "data_with_errors": out,
+        "summary_by_id": summary_by_id,
+        "usage_overall": usage_overall,
+        "notes": notes,
+    }
+
+path, dfs = export_forecast_diagnostics_to_excel(
+    df,
+    "forecast_report.xlsx",
+    id_col="id",
+    year_col="year",
+    year_id_col="year_id",
+    empirical_col="empirical",
+    forecast_cols=["forecast_1", "forecast_2", "forecast_3"],
+    fc_model_cols=[f"fc_model_{i}" for i in range(1, 9)],   # optional
+    dummy_cols=[f"dummy_{i}" for i in range(1, 9)],
+)
+print("Wrote:", path)
