@@ -15,10 +15,7 @@ from openpyxl.utils import get_column_letter
 
 @dataclass
 class ExportConfig:
-    # Absolute relative error: abs((f - y) / y)
     add_conditional_formatting: bool = True
-
-    # Excel aesthetics
     freeze_panes_cell: str = "B2"
     header_fill_hex: str = "1F4E79"
     header_font_color_hex: str = "FFFFFF"
@@ -38,8 +35,7 @@ def _autosize_columns(ws, max_width: int = 55) -> None:
             v = ws.cell(row=row_idx, column=col_idx).value
             if v is None:
                 continue
-            s = str(v)
-            max_len = max(max_len, len(s))
+            max_len = max(max_len, len(str(v)))
         ws.column_dimensions[col_letter].width = min(max_len + 2, max_width)
 
 
@@ -67,6 +63,14 @@ def _apply_percent_format(ws, col_indices: List[int]) -> None:
                 cell.number_format = "0.00%"
 
 
+def _apply_int_format(ws, col_indices: List[int]) -> None:
+    for col_idx in col_indices:
+        for row in range(2, ws.max_row + 1):
+            cell = ws.cell(row=row, column=col_idx)
+            if isinstance(cell.value, (int, float)) and cell.value is not None:
+                cell.number_format = "0"
+
+
 def _add_conditional_formatting_errors(ws, error_col_indices: List[int]) -> None:
     rule = ColorScaleRule(
         start_type="percentile", start_value=10, start_color="63BE7B",
@@ -77,6 +81,58 @@ def _add_conditional_formatting_errors(ws, error_col_indices: List[int]) -> None
         col_letter = get_column_letter(col_idx)
         rng = f"{col_letter}2:{col_letter}{ws.max_row}"
         ws.conditional_formatting.add(rng, rule)
+
+
+def _paired_order(
+    *,
+    id_cols: Sequence[str],
+    empirical_col: str,
+    forecast_cols: Sequence[str],
+    fc_model_cols: Optional[Sequence[str]],
+    dummy_cols: Sequence[str],
+    df_cols: Sequence[str],
+) -> List[str]:
+    """
+    Build column order for data_with_errors:
+      id cols, empirical,
+      forecast_1, rel_err__forecast_1, forecast_2, rel_err__forecast_2, ...
+      fc_model_1, rel_err__fc_model_1, ...
+      dummy_1, dummy_2, ...
+      (any remaining columns at the end, preserving original order)
+    """
+    ordered: List[str] = []
+    seen = set()
+
+    def add(c: str) -> None:
+        if c in df_cols and c not in seen:
+            ordered.append(c)
+            seen.add(c)
+
+    # identifiers + empirical first
+    for c in id_cols:
+        add(c)
+    add(empirical_col)
+
+    # forecasts paired with their errors
+    for c in forecast_cols:
+        add(c)
+        add(f"rel_err__{c}")
+
+    # individual models paired with errors
+    if fc_model_cols:
+        for c in fc_model_cols:
+            add(c)
+            add(f"rel_err__{c}")
+
+    # dummies
+    for c in dummy_cols:
+        add(c)
+
+    # any leftover columns (if your df had extras)
+    for c in df_cols:
+        add(c)
+
+    return ordered
 
 
 def export_forecast_diagnostics_to_excel(
@@ -93,17 +149,11 @@ def export_forecast_diagnostics_to_excel(
     config: Optional[ExportConfig] = None,
 ) -> Tuple[Path, Dict[str, pd.DataFrame]]:
     """
-    Assumptions (based on your answers):
-      - Relative error is absolute: abs((f - y) / y)
-      - empirical is never 0; can be NaN (meaning not observed yet)
-      - dummy NaNs should be ignored in averages (mean(skipna=True))
-      - unweighted averages over rows
+    Relative prognosis error used:
+        abs((forecast - empirical) / empirical)
 
-    Output sheets:
-      - data_with_errors
-      - summary_by_id
-      - usage_overall
-      - notes
+    Dummy NA handling:
+        ignored in averages (skipna=True)
     """
     if config is None:
         config = ExportConfig()
@@ -118,39 +168,58 @@ def export_forecast_diagnostics_to_excel(
         _validate_columns(df, list(fc_model_cols), "fc_model")
 
     out = df.copy()
-
-    # Denominator: empirical (never 0, but can be NaN)
     denom = out[empirical_col].astype(float)
 
     def abs_rel_err(f: pd.Series) -> pd.Series:
         f = f.astype(float)
         y = out[empirical_col].astype(float)
-        # If y is NaN -> result stays NaN automatically
         return ((f - y) / denom).abs()
 
-    # --- Error columns for pooled forecasts
-    error_cols: List[str] = []
+    # ---- compute error columns (pooled)
+    forecast_error_cols: List[str] = []
     for c in forecast_cols:
-        new_c = f"rel_err__{c}"
-        out[new_c] = abs_rel_err(out[c])
-        error_cols.append(new_c)
+        e = f"rel_err__{c}"
+        out[e] = abs_rel_err(out[c])
+        forecast_error_cols.append(e)
 
-    # --- Optional error columns for individual models
+    # ---- compute error columns (individual)
     model_error_cols: List[str] = []
     if use_fc_models:
         for c in fc_model_cols:  # type: ignore[arg-type]
-            new_c = f"rel_err__{c}"
-            out[new_c] = abs_rel_err(out[c])
-            model_error_cols.append(new_c)
+            e = f"rel_err__{c}"
+            out[e] = abs_rel_err(out[c])
+            model_error_cols.append(e)
 
-    # --- Summary: average relative errors per id
+    # ---- summary_by_id: mean + median errors, plus counts of valid comparisons
+    # valid comparisons require BOTH empirical and the forecast/model not-NA
+    def valid_count(col: str) -> pd.Series:
+        return out[[col, empirical_col]].notna().all(axis=1).astype(int)
+
+    # mean errors
     avg_err_by_id = (
-        out.groupby(id_col, dropna=False)[error_cols]
+        out.groupby(id_col, dropna=False)[forecast_error_cols]
         .mean(numeric_only=True)
         .reset_index()
     )
-    avg_err_by_id["avg_rel_err__forecasts"] = avg_err_by_id[error_cols].mean(axis=1, skipna=True)
+    avg_err_by_id["avg_rel_err__forecasts"] = avg_err_by_id[forecast_error_cols].mean(axis=1, skipna=True)
 
+    # median errors (robust)
+    med_err_by_id = (
+        out.groupby(id_col, dropna=False)[forecast_error_cols]
+        .median(numeric_only=True)
+        .reset_index()
+    )
+    med_err_by_id = med_err_by_id.rename(columns={c: c.replace("rel_err__", "med_rel_err__") for c in forecast_error_cols})
+    med_cols = [c.replace("rel_err__", "med_rel_err__") for c in forecast_error_cols]
+    med_err_by_id["med_rel_err__forecasts"] = med_err_by_id[med_cols].median(axis=1, skipna=True)
+
+    # counts (per pooled forecast)
+    counts_df = out[[id_col]].copy()
+    for c in forecast_cols:
+        counts_df[f"n_valid__{c}"] = valid_count(c)
+    n_valid_by_id = counts_df.groupby(id_col, dropna=False).sum(numeric_only=True).reset_index()
+
+    # optional: fc_model mean + median + counts
     if use_fc_models and model_error_cols:
         avg_model_by_id = (
             out.groupby(id_col, dropna=False)[model_error_cols]
@@ -158,9 +227,22 @@ def export_forecast_diagnostics_to_excel(
             .reset_index()
         )
         avg_model_by_id["avg_rel_err__fc_models"] = avg_model_by_id[model_error_cols].mean(axis=1, skipna=True)
-        avg_err_by_id = avg_err_by_id.merge(avg_model_by_id, on=id_col, how="left")
 
-    # --- Dummy usage (NaNs ignored)
+        med_model_by_id = (
+            out.groupby(id_col, dropna=False)[model_error_cols]
+            .median(numeric_only=True)
+            .reset_index()
+        )
+        med_model_by_id = med_model_by_id.rename(columns={c: c.replace("rel_err__", "med_rel_err__") for c in model_error_cols})
+        model_med_cols = [c.replace("rel_err__", "med_rel_err__") for c in model_error_cols]
+        med_model_by_id["med_rel_err__fc_models"] = med_model_by_id[model_med_cols].median(axis=1, skipna=True)
+
+        model_counts_df = out[[id_col]].copy()
+        for c in fc_model_cols:  # type: ignore[arg-type]
+            model_counts_df[f"n_valid__{c}"] = valid_count(c)
+        model_n_valid_by_id = model_counts_df.groupby(id_col, dropna=False).sum(numeric_only=True).reset_index()
+
+    # dummy usage (NaNs ignored)
     dummies = out[list(dummy_cols)].copy()
     dummy_usage_by_id = (
         pd.concat([out[[id_col]], dummies], axis=1)
@@ -170,52 +252,74 @@ def export_forecast_diagnostics_to_excel(
     )
     dummy_usage_by_id["avg_usage__all_models"] = dummy_usage_by_id[list(dummy_cols)].mean(axis=1, skipna=True)
 
-    summary_by_id = avg_err_by_id.merge(dummy_usage_by_id, on=id_col, how="left")
+    # build summary_by_id
+    summary_by_id = (
+        avg_err_by_id
+        .merge(med_err_by_id, on=id_col, how="left")
+        .merge(n_valid_by_id, on=id_col, how="left")
+        .merge(dummy_usage_by_id, on=id_col, how="left")
+    )
 
+    if use_fc_models and model_error_cols:
+        summary_by_id = (
+            summary_by_id
+            .merge(avg_model_by_id, on=id_col, how="left")
+            .merge(med_model_by_id, on=id_col, how="left")
+            .merge(model_n_valid_by_id, on=id_col, how="left")
+        )
+
+    # overall dummy usage
     usage_overall = (
-        dummies.mean(numeric_only=True)  # skipna=True default
+        dummies.mean(numeric_only=True)
         .to_frame("avg_usage")
         .reset_index()
         .rename(columns={"index": "dummy"})
     )
 
-    notes = pd.DataFrame(
-        {
-            "item": [
-                "Relative error definition",
-                "Empirical NaN meaning",
-                "Dummy NA meaning",
-                "Averaging",
-                "Sheets",
-            ],
-            "value": [
-                "abs((forecast - empirical) / empirical)",
-                "No observed value yet => errors are NaN",
-                "Model/spec not available => ignored in usage means",
-                "Unweighted means over rows (skipna=True)",
-                "data_with_errors, summary_by_id, usage_overall, notes",
-            ],
-        }
+    # ---- leaderboard: rank ids by avg_rel_err__forecasts (lower is better)
+    leaderboard_cols = [
+        id_col,
+        "avg_rel_err__forecasts",
+        "med_rel_err__forecasts",
+        "avg_usage__all_models",
+    ]
+    # also include total valid comparisons across pooled forecasts
+    pooled_n_cols = [f"n_valid__{c}" for c in forecast_cols]
+    for c in pooled_n_cols:
+        if c in summary_by_id.columns:
+            leaderboard_cols.append(c)
+
+    leaderboard = summary_by_id[leaderboard_cols].copy()
+    # total valid comparisons across all pooled forecasts (helps interpret stability)
+    existing_n = [c for c in pooled_n_cols if c in leaderboard.columns]
+    if existing_n:
+        leaderboard["n_valid__pooled_total"] = leaderboard[existing_n].sum(axis=1, numeric_only=True)
+
+    leaderboard = leaderboard.sort_values("avg_rel_err__forecasts", ascending=True, na_position="last").reset_index(drop=True)
+    leaderboard.insert(0, "rank", np.arange(1, len(leaderboard) + 1))
+
+    # ---- reorder data_with_errors: pair each value col with its rel_err col
+    ordered_cols = _paired_order(
+        id_cols=[id_col, year_col, year_id_col],
+        empirical_col=empirical_col,
+        forecast_cols=forecast_cols,
+        fc_model_cols=list(fc_model_cols) if use_fc_models else None,
+        dummy_cols=dummy_cols,
+        df_cols=list(out.columns),
     )
+    out = out[ordered_cols]
 
-    # Column ordering: identifiers first, then original cols, then rel_err__* at end
-    id_cols = [id_col, year_col, year_id_col]
-    keep_first = [c for c in id_cols if c in out.columns]
-    remaining = [c for c in out.columns if c not in keep_first]
-    non_error = [c for c in remaining if not (isinstance(c, str) and c.startswith("rel_err__"))]
-    all_error = [c for c in remaining if isinstance(c, str) and c.startswith("rel_err__")]
-    out = out[keep_first + non_error + all_error]
-
-    # Write with pandas
+    # ---- write excel
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         out.to_excel(writer, index=False, sheet_name="data_with_errors")
         summary_by_id.to_excel(writer, index=False, sheet_name="summary_by_id")
+        leaderboard.to_excel(writer, index=False, sheet_name="leaderboard")
         usage_overall.to_excel(writer, index=False, sheet_name="usage_overall")
-        notes.to_excel(writer, index=False, sheet_name="notes")
 
-    # Post-format with openpyxl
+    # ---- formatting
     wb = load_workbook(output_path)
-    for sheet_name in ["data_with_errors", "summary_by_id", "usage_overall", "notes"]:
+
+    for sheet_name in ["data_with_errors", "summary_by_id", "leaderboard", "usage_overall"]:
         ws = wb[sheet_name]
         _style_header(ws, config.header_fill_hex, config.header_font_color_hex)
         _add_filters(ws)
@@ -226,15 +330,15 @@ def export_forecast_diagnostics_to_excel(
             for cell in row:
                 cell.alignment = Alignment(vertical="top", wrap_text=False)
 
-    # Percent formats + conditional formatting
+    # percent formats + conditional formatting for rel_err columns in data_with_errors
     ws_data = wb["data_with_errors"]
     data_headers = [c.value for c in ws_data[1]]
-    data_error_cols = [i + 1 for i, h in enumerate(data_headers) if isinstance(h, str) and h.startswith("rel_err__")]
-    _apply_percent_format(ws_data, data_error_cols)
+    data_err_cols = [i + 1 for i, h in enumerate(data_headers) if isinstance(h, str) and h.startswith("rel_err__")]
+    _apply_percent_format(ws_data, data_err_cols)
+    if config.add_conditional_formatting and data_err_cols:
+        _add_conditional_formatting_errors(ws_data, data_err_cols)
 
-    if config.add_conditional_formatting and data_error_cols:
-        _add_conditional_formatting_errors(ws_data, data_error_cols)
-
+    # summary_by_id: format error + usage columns as percent, n_valid columns as int
     ws_sum = wb["summary_by_id"]
     sum_headers = [c.value for c in ws_sum[1]]
     sum_pct_cols = [
@@ -242,12 +346,24 @@ def export_forecast_diagnostics_to_excel(
         if isinstance(h, str) and (
             h.startswith("rel_err__")
             or h.startswith("avg_rel_err__")
+            or h.startswith("med_rel_err__")
             or h.startswith("avg_usage__")
             or h in set(dummy_cols)
         )
     ]
+    sum_int_cols = [i + 1 for i, h in enumerate(sum_headers) if isinstance(h, str) and h.startswith("n_valid__")]
     _apply_percent_format(ws_sum, sum_pct_cols)
+    _apply_int_format(ws_sum, sum_int_cols)
 
+    # leaderboard: percent cols + int cols
+    ws_lb = wb["leaderboard"]
+    lb_headers = [c.value for c in ws_lb[1]]
+    lb_pct_cols = [i + 1 for i, h in enumerate(lb_headers) if h in {"avg_rel_err__forecasts", "med_rel_err__forecasts", "avg_usage__all_models"}]
+    lb_int_cols = [i + 1 for i, h in enumerate(lb_headers) if isinstance(h, str) and (h == "rank" or h.startswith("n_valid__"))]
+    _apply_percent_format(ws_lb, lb_pct_cols)
+    _apply_int_format(ws_lb, lb_int_cols)
+
+    # usage_overall: avg_usage percent
     ws_usage = wb["usage_overall"]
     usage_headers = [c.value for c in ws_usage[1]]
     if "avg_usage" in usage_headers:
@@ -258,19 +374,6 @@ def export_forecast_diagnostics_to_excel(
     return output_path, {
         "data_with_errors": out,
         "summary_by_id": summary_by_id,
+        "leaderboard": leaderboard,
         "usage_overall": usage_overall,
-        "notes": notes,
     }
-
-path, dfs = export_forecast_diagnostics_to_excel(
-    df,
-    "forecast_report.xlsx",
-    id_col="id",
-    year_col="year",
-    year_id_col="year_id",
-    empirical_col="empirical",
-    forecast_cols=["forecast_1", "forecast_2", "forecast_3"],
-    fc_model_cols=[f"fc_model_{i}" for i in range(1, 9)],   # optional
-    dummy_cols=[f"dummy_{i}" for i in range(1, 9)],
-)
-print("Wrote:", path)
