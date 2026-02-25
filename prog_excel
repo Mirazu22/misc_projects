@@ -19,7 +19,8 @@ class ExportConfig:
     header_fill_hex: str = "1F4E79"
     header_font_color_hex: str = "FFFFFF"
     add_conditional_formatting: bool = True
-    try_add_boxplots: bool = True  # "Only if easily implemented"
+    # symmetric scaling bound for signed rel errors: percentile of |rel_err|
+    signed_scale_percentile: float = 95.0
 
 
 def _validate_columns(df: pd.DataFrame, cols: Sequence[str], label: str) -> None:
@@ -73,17 +74,28 @@ def _apply_float_format(ws, col_indices: List[int], fmt: str = "0.0000") -> None
                 cell.number_format = fmt
 
 
-def _add_color_scale(ws, col_indices: List[int]) -> None:
-    # Green (low) -> Yellow -> Red (high)
+def _add_symmetric_zero_centered_scale(ws, col_idx: int, max_abs: float) -> None:
+    """
+    3-color scale: -max_abs (red) -> 0 (green) -> +max_abs (red)
+    """
+    if not np.isfinite(max_abs) or max_abs <= 0:
+        return
+
     rule = ColorScaleRule(
-        start_type="percentile", start_value=10, start_color="63BE7B",
-        mid_type="percentile", mid_value=50, mid_color="FFEB84",
-        end_type="percentile", end_value=90, end_color="F8696B",
+        start_type="num",
+        start_value=-max_abs,
+        start_color="F8696B",  # red
+        mid_type="num",
+        mid_value=0,
+        mid_color="63BE7B",  # green
+        end_type="num",
+        end_value=max_abs,
+        end_color="F8696B",  # red
     )
-    for col_idx in col_indices:
-        col_letter = get_column_letter(col_idx)
-        rng = f"{col_letter}2:{col_letter}{ws.max_row}"
-        ws.conditional_formatting.add(rng, rule)
+
+    col_letter = get_column_letter(col_idx)
+    rng = f"{col_letter}2:{col_letter}{ws.max_row}"
+    ws.conditional_formatting.add(rng, rule)
 
 
 def _rmse_log_series(f: pd.Series, y: pd.Series) -> float:
@@ -118,12 +130,12 @@ def export_forecast_diagnostics_to_excel_v2(
     Implements:
       - data_with_errors reordered so error cols sit next to their model columns
       - compute signed and abs relative error; show signed, hide abs in data_with_errors
-      - same conditional color scale applied to both signed and abs columns; abs hidden
+      - conditional formatting on signed rel errors:
+          symmetric red-green-red centered at 0, bounds set by p-th percentile of |rel_err|
+      - NO conditional formatting for abs columns (they're hidden)
       - summary_by_id: mean abs rel err, mean signed rel err, RMSE log for each model
       - summary_by_model: same metrics but ignoring id
-      - optional box plot sheet for signed relative errors (if openpyxl supports it)
-
-    Returns (path, dict_of_dataframes_written).
+      - boxplot creation removed
     """
     if config is None:
         config = ExportConfig()
@@ -169,7 +181,6 @@ def export_forecast_diagnostics_to_excel_v2(
     id_cols = [id_col, year_col, year_id_col]
     base_prefix = [c for c in id_cols if c in out.columns]
 
-    # Everything that's NOT a model col and NOT an error col
     error_like = set(rel_cols.values()) | set(abs_rel_cols.values())
     model_set = set(model_cols_all)
 
@@ -178,12 +189,6 @@ def export_forecast_diagnostics_to_excel_v2(
         if c not in set(base_prefix) and c not in model_set and c not in error_like
     ]
 
-    # Build grouped layout: ... empirical, dummies, etc. in "other_cols"
-    # We will keep "other_cols" in their original order, but insert model blocks after them?
-    # Usually you'd want empirical near models, so keep original order by default:
-    # We place: base_prefix + other_cols + blocks(for each model)
-    # BUT user wants errors next to their model values. We'll enforce that within blocks.
-    # And we keep original model order: forecast_cols then fc_model_cols.
     model_blocks: List[str] = []
     for m in model_cols_all:
         model_blocks.extend([m, rel_cols[m], abs_rel_cols[m]])
@@ -193,12 +198,7 @@ def export_forecast_diagnostics_to_excel_v2(
     # --------------------------
     # Summary_by_id
     # --------------------------
-    # For each model m compute per-id:
-    #  - mean abs rel err
-    #  - mean signed rel err
-    #  - rmse log
     grp = out.groupby(id_col, dropna=False)
-
     rows = []
     for gid, g in grp:
         row = {id_col: gid}
@@ -207,10 +207,12 @@ def export_forecast_diagnostics_to_excel_v2(
             row[f"mean_abs_rel_err__{m}"] = pd.to_numeric(g[abs_rel_cols[m]], errors="coerce").mean(skipna=True)
             row[f"mean_rel_err__{m}"] = pd.to_numeric(g[rel_cols[m]], errors="coerce").mean(skipna=True)
             row[f"rmse_log__{m}"] = _rmse_log_series(g[m], y_g)
-        # dummy usage (ignore NA)
+
         for d in dummy_cols:
             row[f"avg_usage__{d}"] = pd.to_numeric(g[d], errors="coerce").mean(skipna=True)
-        row["avg_usage__all_models"] = np.nanmean([row[f"avg_usage__{d}"] for d in dummy_cols]) if dummy_cols else float("nan")
+        row["avg_usage__all_models"] = (
+            float(np.nanmean([row[f"avg_usage__{d}"] for d in dummy_cols])) if dummy_cols else float("nan")
+        )
         rows.append(row)
 
     summary_by_id = pd.DataFrame(rows)
@@ -261,23 +263,33 @@ def export_forecast_diagnostics_to_excel_v2(
             for cell in row:
                 cell.alignment = Alignment(vertical="top", wrap_text=False)
 
-    # --- data_with_errors: format + conditional + hide abs cols
+    # --- data_with_errors: format + symmetric conditional on signed rel errors, hide abs cols
     ws_data = wb["data_with_errors"]
     headers = [c.value for c in ws_data[1]]
 
-    # signed rel error columns
     signed_idx = [i + 1 for i, h in enumerate(headers) if isinstance(h, str) and h.startswith("rel_err__")]
     abs_idx = [i + 1 for i, h in enumerate(headers) if isinstance(h, str) and h.startswith("abs_rel_err__")]
 
+    # Percent formatting for both (abs hidden but still percent-formatted)
     _apply_percent_format(ws_data, signed_idx + abs_idx)
 
     if config.add_conditional_formatting:
-        # Apply same color rule to both signed and abs (then hide abs):
-        # This gives signed columns the same kind of “magnitude” coloring as abs.
-        _add_color_scale(ws_data, signed_idx)
-        _add_color_scale(ws_data, abs_idx)
+        p = float(config.signed_scale_percentile)
 
-    # Hide abs columns
+        for col_idx in signed_idx:
+            vals = []
+            for r in range(2, ws_data.max_row + 1):
+                v = ws_data.cell(row=r, column=col_idx).value
+                if isinstance(v, (int, float)) and v is not None and np.isfinite(v):
+                    vals.append(float(v))
+
+            if len(vals) == 0:
+                continue
+
+            max_abs = float(np.nanpercentile(np.abs(vals), p))
+            _add_symmetric_zero_centered_scale(ws_data, col_idx, max_abs=max_abs)
+
+    # Hide abs columns (no coloring applied to them)
     for col_idx in abs_idx:
         ws_data.column_dimensions[get_column_letter(col_idx)].hidden = True
 
@@ -312,65 +324,6 @@ def export_forecast_diagnostics_to_excel_v2(
 
     _apply_percent_format(ws_sum_model, sm_pct)
     _apply_float_format(ws_sum_model, sm_float, fmt="0.0000")
-
-    # --------------------------
-    # Optional: box plots of signed relative errors
-    # --------------------------
-    if config.try_add_boxplots:
-        try:
-            from openpyxl.chart import BoxWhiskerChart, Reference
-
-            # Create a helper sheet with the signed rel errors in columns
-            # (This keeps chart ranges clean and avoids wide formulas.)
-            helper_name = "_boxplot_data"
-            if helper_name in wb.sheetnames:
-                del wb[helper_name]
-            ws_help = wb.create_sheet(helper_name)
-
-            # Write headers
-            ws_help.cell(row=1, column=1, value="row")
-            for j, m in enumerate(model_cols_all, start=2):
-                ws_help.cell(row=1, column=j, value=m)
-
-            # Pull signed errors from out_data (already in that sheet, but we write raw values)
-            # Create a dense matrix: each model's signed rel error series
-            signed_df = pd.DataFrame({m: pd.to_numeric(out[rel_cols[m]], errors="coerce") for m in model_cols_all})
-            signed_df = signed_df.reset_index(drop=True)
-
-            for i in range(len(signed_df)):
-                ws_help.cell(row=i + 2, column=1, value=i)
-                for j, m in enumerate(model_cols_all, start=2):
-                    v = signed_df.at[i, m]
-                    ws_help.cell(row=i + 2, column=j, value=None if pd.isna(v) else float(v))
-
-            # Create chart sheet
-            chart_sheet_name = "boxplots_rel_err"
-            if chart_sheet_name in wb.sheetnames:
-                del wb[chart_sheet_name]
-            ws_chart = wb.create_sheet(chart_sheet_name)
-
-            chart = BoxWhiskerChart()
-            chart.title = "Box plots: signed relative errors"
-            chart.y_axis.title = "Relative error (signed)"
-            chart.x_axis.title = "Model"
-
-            data_ref = Reference(
-                ws_help,
-                min_col=2,
-                min_row=1,
-                max_col=1 + len(model_cols_all),
-                max_row=1 + len(signed_df),
-            )
-            chart.add_data(data_ref, titles_from_data=True)
-
-            ws_chart.add_chart(chart, "A1")
-
-            # Hide helper
-            ws_help.sheet_state = "hidden"
-
-        except Exception:
-            # If BoxWhiskerChart isn't available or charting fails, we just skip.
-            pass
 
     wb.save(output_path)
 
