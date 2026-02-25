@@ -9,16 +9,27 @@ import pandas as pd
 
 from openpyxl import load_workbook
 from openpyxl.styles import Font, Alignment, PatternFill
-from openpyxl.formatting.rule import ColorScaleRule
 from openpyxl.utils import get_column_letter
+from openpyxl.formatting.rule import FormulaRule
 
 
 @dataclass
 class ExportConfig:
-    add_conditional_formatting: bool = True
+    # Excel aesthetics
     freeze_panes_cell: str = "B2"
     header_fill_hex: str = "1F4E79"
     header_font_color_hex: str = "FFFFFF"
+
+    # Conditional formatting (3-tier based on abs(error) quantiles)
+    add_abs_distance_formatting: bool = True
+    # Quantiles for tiering (per error column)
+    q_low: float = 0.33
+    q_high: float = 0.66
+
+    # Fills for conditional tiers (green/yellow/red)
+    fill_good_hex: str = "63BE7B"
+    fill_mid_hex: str = "FFEB84"
+    fill_bad_hex: str = "F8696B"
 
 
 def _validate_columns(df: pd.DataFrame, cols: Sequence[str], label: str) -> None:
@@ -35,7 +46,8 @@ def _autosize_columns(ws, max_width: int = 55) -> None:
             v = ws.cell(row=row_idx, column=col_idx).value
             if v is None:
                 continue
-            max_len = max(max_len, len(str(v)))
+            s = str(v)
+            max_len = max(max_len, len(s))
         ws.column_dimensions[col_letter].width = min(max_len + 2, max_width)
 
 
@@ -63,17 +75,98 @@ def _apply_percent_format(ws, col_indices: List[int]) -> None:
                 cell.number_format = "0.00%"
 
 
-def _add_conditional_formatting(ws, col_indices: List[int]) -> None:
-    # Green (low) -> Yellow -> Red (high)
-    rule = ColorScaleRule(
-        start_type="percentile", start_value=10, start_color="63BE7B",
-        mid_type="percentile", mid_value=50, mid_color="FFEB84",
-        end_type="percentile", end_value=90, end_color="F8696B"
-    )
+def _apply_float_format(ws, col_indices: List[int]) -> None:
     for col_idx in col_indices:
-        col_letter = get_column_letter(col_idx)
-        rng = f"{col_letter}2:{col_letter}{ws.max_row}"
-        ws.conditional_formatting.add(rng, rule)
+        for row in range(2, ws.max_row + 1):
+            cell = ws.cell(row=row, column=col_idx)
+            if isinstance(cell.value, (int, float)) and cell.value is not None:
+                cell.number_format = "0.0000"
+
+
+def _col_index_map(ws) -> Dict[str, int]:
+    headers = [c.value for c in ws[1]]
+    out: Dict[str, int] = {}
+    for i, h in enumerate(headers):
+        if isinstance(h, str):
+            out[h] = i + 1
+    return out
+
+
+def _safe_rmse(x: pd.Series) -> float:
+    x = x.astype(float)
+    x = x.replace([np.inf, -np.inf], np.nan).dropna()
+    if len(x) == 0:
+        return np.nan
+    return float(np.sqrt(np.mean(x**2)))
+
+
+def _rmse_log_diff(f: pd.Series, y: pd.Series) -> pd.Series:
+    """
+    Row-wise log diff: log(f) - log(y), NaN if f<=0 or y<=0 or missing.
+    """
+    f = f.astype(float)
+    y = y.astype(float)
+    ok = (f > 0) & (y > 0) & f.notna() & y.notna()
+    out = pd.Series(np.nan, index=f.index, dtype=float)
+    out.loc[ok] = np.log(f.loc[ok]) - np.log(y.loc[ok])
+    return out
+
+
+def _apply_abs_distance_conditional_formatting(
+    ws,
+    col_idx: int,
+    q_low: float,
+    q_high: float,
+    fill_good_hex: str,
+    fill_mid_hex: str,
+    fill_bad_hex: str,
+) -> None:
+    """
+    Colors a column by ABS(cell) distance from 0 using 3 tiers.
+    Thresholds are computed from ABS(values) quantiles.
+    """
+    # Collect numeric values from the column
+    vals = []
+    for row in range(2, ws.max_row + 1):
+        v = ws.cell(row=row, column=col_idx).value
+        if isinstance(v, (int, float)) and v is not None and np.isfinite(v):
+            vals.append(abs(float(v)))
+
+    if len(vals) < 5:
+        return  # too few to compute meaningful quantiles
+
+    low_thr = float(np.quantile(vals, q_low))
+    high_thr = float(np.quantile(vals, q_high))
+
+    col_letter = get_column_letter(col_idx)
+    rng = f"{col_letter}2:{col_letter}{ws.max_row}"
+
+    fill_good = PatternFill("solid", fgColor=fill_good_hex)
+    fill_mid = PatternFill("solid", fgColor=fill_mid_hex)
+    fill_bad = PatternFill("solid", fgColor=fill_bad_hex)
+
+    # Formulas are evaluated relative to top-left of the range; use the first row cell address
+    top_cell = f"{col_letter}2"
+
+    # Worst tier: ABS(cell) > high_thr
+    rule_bad = FormulaRule(
+        formula=[f"ABS({top_cell})>{high_thr}"],
+        fill=fill_bad
+    )
+    # Middle tier: low_thr < ABS(cell) <= high_thr
+    rule_mid = FormulaRule(
+        formula=[f"AND(ABS({top_cell})>{low_thr},ABS({top_cell})<={high_thr})"],
+        fill=fill_mid
+    )
+    # Best tier: ABS(cell) <= low_thr
+    rule_good = FormulaRule(
+        formula=[f"ABS({top_cell})<={low_thr}"],
+        fill=fill_good
+    )
+
+    ws.conditional_formatting.add(rng, rule_bad)
+    ws.conditional_formatting.add(rng, rule_mid)
+    ws.conditional_formatting.add(rng, rule_good)
 
 
 def export_forecast_diagnostics_to_excel(
@@ -87,23 +180,17 @@ def export_forecast_diagnostics_to_excel(
     forecast_cols: Sequence[str],
     dummy_cols: Sequence[str],
     fc_model_cols: Optional[Sequence[str]] = None,
-    keep_original_order_for_other_cols: bool = True,
     config: Optional[ExportConfig] = None,
 ) -> Tuple[Path, Dict[str, pd.DataFrame]]:
     """
-    Creates a formatted Excel report.
+    Implements:
+      - data_with_errors: signed relative errors next to each corresponding series
+      - summary_by_id: mean abs rel err, mean signed rel err, RMSE(log(f)-log(y)) per id and series
+      - summary_by_model: same metrics per series (ignoring id)
+      - dummy usage (NA ignored) per id + overall
 
-    Key features requested:
-      - data_with_errors reordered: each method column immediately followed by its abs and signed rel errors
-      - excludes notes sheet
-      - adds overall averages across all rows for each method, incl polarity (signed error)
-      - dummy NA ignored in averages
-
-    Sheets:
-      1) data_with_errors
-      2) summary_by_id
-      3) overall_method_diagnostics
-      4) usage_overall
+    Relative error (signed): (f - y) / y
+    Absolute relative error used in summaries: abs((f - y) / y)
     """
     if config is None:
         config = ExportConfig()
@@ -111,6 +198,7 @@ def export_forecast_diagnostics_to_excel(
     output_path = Path(output_path)
     use_fc_models = fc_model_cols is not None and len(fc_model_cols) > 0
 
+    # Validate columns
     _validate_columns(df, [id_col, year_col, year_id_col, empirical_col], "base required")
     _validate_columns(df, list(forecast_cols), "forecast")
     _validate_columns(df, list(dummy_cols), "dummy")
@@ -118,177 +206,153 @@ def export_forecast_diagnostics_to_excel(
         _validate_columns(df, list(fc_model_cols), "fc_model")
 
     out = df.copy()
-
-    # empirical can be NaN (not observed yet). You said it is never 0.
     y = out[empirical_col].astype(float)
 
-    def signed_rel_err(f: pd.Series) -> pd.Series:
-        f = f.astype(float)
-        return (f - y) / y
+    # Series we compute diagnostics for
+    series_cols: List[str] = list(forecast_cols) + (list(fc_model_cols) if use_fc_models else [])
 
-    def abs_rel_err(f: pd.Series) -> pd.Series:
-        return signed_rel_err(f).abs()
+    # Signed relative error columns for data sheet
+    rel_err_cols: Dict[str, str] = {}  # series_col -> rel_err_col_name
+    for c in series_cols:
+        new_c = f"rel_err__{c}"
+        out[new_c] = (out[c].astype(float) - y) / y  # signed
+        rel_err_cols[c] = new_c
 
-    # ---- Create error cols
-    # Naming: abs_rel_err__X and signed_rel_err__X
-    abs_err_cols: List[str] = []
-    signed_err_cols: List[str] = []
-
-    def add_error_cols_for(method_col: str) -> Tuple[str, str]:
-        abs_c = f"abs_rel_err__{method_col}"
-        sgn_c = f"signed_rel_err__{method_col}"
-        out[sgn_c] = signed_rel_err(out[method_col])
-        out[abs_c] = out[sgn_c].abs()
-        abs_err_cols.append(abs_c)
-        signed_err_cols.append(sgn_c)
-        return abs_c, sgn_c
-
-    for c in forecast_cols:
-        add_error_cols_for(c)
-
-    if use_fc_models:
-        for c in fc_model_cols:  # type: ignore[arg-type]
-            add_error_cols_for(c)
-
-    # ---- data_with_errors column ordering
-    id_cols = [id_col, year_col, year_id_col]
-
-    # "Other" original columns: keep them, but place method blocks (value + errors) as requested.
-    method_cols = list(forecast_cols) + (list(fc_model_cols) if use_fc_models else [])
+    # ---- Build data_with_errors column order: identifiers + [col, rel_err__col] pairs ----
+    id_cols_ordered = [id_col, year_col, year_id_col]
+    keep_first = [c for c in id_cols_ordered if c in out.columns]
 
     # Start with identifiers
-    ordered_cols: List[str] = [c for c in id_cols if c in out.columns]
+    data_cols: List[str] = keep_first.copy()
 
-    # Keep empirical early (right after ids) because it's the benchmark
-    if empirical_col not in ordered_cols:
-        ordered_cols.append(empirical_col)
+    # Add empirical early (no error column)
+    if empirical_col not in data_cols:
+        data_cols.append(empirical_col)
 
-    # Optionally keep the remaining original (non-method, non-error) columns before method blocks
-    # Your schema includes dummies; I put dummies AFTER method blocks by default for readability.
-    original_cols = list(df.columns)
+    # Add forecast + error pairs
+    for c in forecast_cols:
+        if c not in data_cols:
+            data_cols.append(c)
+        rc = rel_err_cols[c]
+        if rc not in data_cols:
+            data_cols.append(rc)
 
-    # define "non-block" original cols excluding ids, empirical, method cols, and dummies (handled later)
-    excluded = set(ordered_cols) | set(method_cols) | set(dummy_cols)
-    other_original = [c for c in original_cols if c not in excluded]
+    # Add dummies next (as they describe model usage)
+    for c in dummy_cols:
+        if c not in data_cols:
+            data_cols.append(c)
 
-    if keep_original_order_for_other_cols:
-        ordered_cols.extend(other_original)
-    else:
-        ordered_cols.extend(sorted(other_original))
+    # Add fc_models + error pairs
+    if use_fc_models:
+        for c in fc_model_cols:  # type: ignore[arg-type]
+            if c not in data_cols:
+                data_cols.append(c)
+            rc = rel_err_cols[c]
+            if rc not in data_cols:
+                data_cols.append(rc)
 
-    # Add method blocks: value + abs error + signed error
-    for c in method_cols:
-        abs_c = f"abs_rel_err__{c}"
-        sgn_c = f"signed_rel_err__{c}"
-        ordered_cols.extend([c, abs_c, sgn_c])
+    # Finally, append any remaining columns not captured (keeps you safe if df has extras)
+    remaining = [c for c in out.columns if c not in data_cols]
+    data_cols.extend(remaining)
 
-    # Add dummies at the end (still in original order)
-    ordered_cols.extend([c for c in dummy_cols if c in out.columns])
+    out_data = out[data_cols]
 
-    # There might be any remaining columns (unlikely) — append them safely
-    remaining = [c for c in out.columns if c not in ordered_cols]
-    ordered_cols.extend(remaining)
+    # ---- Summary metrics ----
+    # Per-row absolute rel error for summaries
+    abs_rel = {}
+    for c in series_cols:
+        abs_rel[c] = out[rel_err_cols[c]].abs()
 
-    out = out[ordered_cols]
+    # Per-row log diff for RMSE logs
+    log_diff = {}
+    for c in series_cols:
+        log_diff[c] = _rmse_log_diff(out[c], y)
 
-    # ---- summary_by_id
-    # Average absolute errors per id for each method (pooled forecasts + optionally fc_models)
-    abs_cols_forecasts = [f"abs_rel_err__{c}" for c in forecast_cols]
-    signed_cols_forecasts = [f"signed_rel_err__{c}" for c in forecast_cols]
-
-    summary_by_id = (
-        out.groupby(id_col, dropna=False)[abs_cols_forecasts + signed_cols_forecasts]
+    # ---- summary_by_id ----
+    # mean signed rel error per id
+    mean_rel_by_id = (
+        out.groupby(id_col, dropna=False)[[rel_err_cols[c] for c in series_cols]]
         .mean(numeric_only=True)
         .reset_index()
     )
-    summary_by_id["avg_abs_rel_err__forecasts"] = summary_by_id[abs_cols_forecasts].mean(axis=1, skipna=True)
-    summary_by_id["avg_signed_rel_err__forecasts"] = summary_by_id[signed_cols_forecasts].mean(axis=1, skipna=True)
+    mean_rel_by_id = mean_rel_by_id.rename(columns={rel_err_cols[c]: f"mean_rel_err__{c}" for c in series_cols})
 
-    if use_fc_models:
-        abs_cols_models = [f"abs_rel_err__{c}" for c in fc_model_cols]  # type: ignore[arg-type]
-        signed_cols_models = [f"signed_rel_err__{c}" for c in fc_model_cols]  # type: ignore[arg-type]
+    # mean abs rel error per id
+    abs_rel_df = pd.DataFrame({f"mean_abs_rel_err__{c}": abs_rel[c] for c in series_cols})
+    abs_rel_df[id_col] = out[id_col].values
+    mean_abs_by_id = (
+        abs_rel_df.groupby(id_col, dropna=False)[[f"mean_abs_rel_err__{c}" for c in series_cols]]
+        .mean(numeric_only=True)
+        .reset_index()
+    )
 
-        model_part = (
-            out.groupby(id_col, dropna=False)[abs_cols_models + signed_cols_models]
-            .mean(numeric_only=True)
-            .reset_index()
-        )
-        model_part["avg_abs_rel_err__fc_models"] = model_part[abs_cols_models].mean(axis=1, skipna=True)
-        model_part["avg_signed_rel_err__fc_models"] = model_part[signed_cols_models].mean(axis=1, skipna=True)
+    # RMSE log diff per id
+    log_df = pd.DataFrame({f"logdiff__{c}": log_diff[c] for c in series_cols})
+    log_df[id_col] = out[id_col].values
 
-        summary_by_id = summary_by_id.merge(model_part, on=id_col, how="left")
+    rmse_log_by_id_rows = []
+    for g, sub in log_df.groupby(id_col, dropna=False):
+        row = {id_col: g}
+        for c in series_cols:
+            row[f"rmse_log__{c}"] = _safe_rmse(sub[f"logdiff__{c}"])
+        rmse_log_by_id_rows.append(row)
+    rmse_log_by_id = pd.DataFrame(rmse_log_by_id_rows)
 
-    # Add dummy usage per id (NaNs ignored => default mean(skipna=True))
-    dummies = out[list(dummy_cols)].copy()
+    # Dummy usage per id (NA ignored automatically)
     dummy_usage_by_id = (
-        pd.concat([out[[id_col]], dummies], axis=1)
-        .groupby(id_col, dropna=False)[list(dummy_cols)]
+        out.groupby(id_col, dropna=False)[list(dummy_cols)]
         .mean(numeric_only=True)
         .reset_index()
     )
     dummy_usage_by_id["avg_usage__all_models"] = dummy_usage_by_id[list(dummy_cols)].mean(axis=1, skipna=True)
 
-    summary_by_id = summary_by_id.merge(dummy_usage_by_id, on=id_col, how="left")
+    summary_by_id = (
+        mean_abs_by_id
+        .merge(mean_rel_by_id, on=id_col, how="left")
+        .merge(rmse_log_by_id, on=id_col, how="left")
+        .merge(dummy_usage_by_id, on=id_col, how="left")
+    )
 
-    # ---- Overall method diagnostics across ALL rows (polarity etc.)
-    # We compute per method: mean(abs rel err), mean(signed rel err), share overestimate, n
-    records = []
-    for c in method_cols:
-        abs_c = f"abs_rel_err__{c}"
-        sgn_c = f"signed_rel_err__{c}"
-        s = out[sgn_c]
-        a = out[abs_c]
-
-        valid = s.notna() & a.notna()
-        n = int(valid.sum())
-
-        mean_abs = float(a[valid].mean()) if n > 0 else np.nan
-        mean_signed = float(s[valid].mean()) if n > 0 else np.nan
-        share_over = float((s[valid] > 0).mean()) if n > 0 else np.nan
-
-        # simple direction label
-        if n == 0 or pd.isna(mean_signed):
-            direction = np.nan
-        elif mean_signed > 0:
-            direction = "overestimate"
-        elif mean_signed < 0:
-            direction = "underestimate"
-        else:
-            direction = "neutral"
-
-        records.append(
+    # ---- summary_by_model (ignore id) ----
+    # one row per series column
+    rows = []
+    for c in series_cols:
+        rel = out[rel_err_cols[c]].astype(float)
+        absr = rel.abs()
+        ld = log_diff[c]
+        rows.append(
             {
-                "method": c,
-                "method_type": "forecast" if c in forecast_cols else "fc_model",
-                "n": n,
-                "mean_abs_rel_err": mean_abs,
-                "mean_signed_rel_err": mean_signed,
-                "share_overestimate": share_over,
-                "direction_by_mean_signed": direction,
+                "model": c,
+                "mean_abs_rel_err": float(absr.mean(skipna=True)),
+                "mean_rel_err": float(rel.mean(skipna=True)),
+                "rmse_log": _safe_rmse(ld),
+                "n_rel_err": int(rel.notna().sum()),
+                "n_log_rmse": int(pd.Series(ld).notna().sum()),
             }
         )
+    summary_by_model = pd.DataFrame(rows)
 
-    overall_method_diagnostics = pd.DataFrame(records)
-
-    # ---- Usage overall
+    # ---- usage_overall ----
     usage_overall = (
-        dummies.mean(numeric_only=True)  # skipna=True default
+        out[list(dummy_cols)]
+        .mean(numeric_only=True)
         .to_frame("avg_usage")
         .reset_index()
         .rename(columns={"index": "dummy"})
     )
 
-    # ---- Write to Excel
+    # Write sheets (NO notes)
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-        out.to_excel(writer, index=False, sheet_name="data_with_errors")
+        out_data.to_excel(writer, index=False, sheet_name="data_with_errors")
         summary_by_id.to_excel(writer, index=False, sheet_name="summary_by_id")
-        overall_method_diagnostics.to_excel(writer, index=False, sheet_name="overall_method_diagnostics")
+        summary_by_model.to_excel(writer, index=False, sheet_name="summary_by_model")
         usage_overall.to_excel(writer, index=False, sheet_name="usage_overall")
 
-    # ---- Format with openpyxl
+    # ---- Excel formatting ----
     wb = load_workbook(output_path)
+    sheet_names = ["data_with_errors", "summary_by_id", "summary_by_model", "usage_overall"]
 
-    for sheet_name in ["data_with_errors", "summary_by_id", "overall_method_diagnostics", "usage_overall"]:
+    for sheet_name in sheet_names:
         ws = wb[sheet_name]
         _style_header(ws, config.header_fill_hex, config.header_font_color_hex)
         _add_filters(ws)
@@ -299,61 +363,54 @@ def export_forecast_diagnostics_to_excel(
             for cell in row:
                 cell.alignment = Alignment(vertical="top", wrap_text=False)
 
-    # Percent formatting:
-    # - data_with_errors: abs_rel_err__* and signed_rel_err__*
+    # Formats + conditional formatting on data_with_errors error columns
     ws_data = wb["data_with_errors"]
-    data_headers = [c.value for c in ws_data[1]]
-    data_pct_cols = [
-        i + 1 for i, h in enumerate(data_headers)
-        if isinstance(h, str) and (h.startswith("abs_rel_err__") or h.startswith("signed_rel_err__"))
-    ]
-    _apply_percent_format(ws_data, data_pct_cols)
+    hdr_to_idx = _col_index_map(ws_data)
 
-    # Conditional formatting: only for ABS error cols (usually what you want heat-mapped)
-    if config.add_conditional_formatting:
-        abs_cols_idx = [
-            i + 1 for i, h in enumerate(data_headers)
-            if isinstance(h, str) and h.startswith("abs_rel_err__")
-        ]
-        if abs_cols_idx:
-            _add_conditional_formatting(ws_data, abs_cols_idx)
+    # Signed relative error columns are percentages
+    data_err_cols_idx = [hdr_to_idx[f"rel_err__{c}"] for c in series_cols if f"rel_err__{c}" in hdr_to_idx]
+    _apply_percent_format(ws_data, data_err_cols_idx)
 
-    # summary_by_id: percent cols include abs/signed + avg_usage + dummies
+    if config.add_abs_distance_formatting:
+        for col_idx in data_err_cols_idx:
+            _apply_abs_distance_conditional_formatting(
+                ws_data,
+                col_idx=col_idx,
+                q_low=config.q_low,
+                q_high=config.q_high,
+                fill_good_hex=config.fill_good_hex,
+                fill_mid_hex=config.fill_mid_hex,
+                fill_bad_hex=config.fill_bad_hex,
+            )
+
+    # summary_by_id: percent for mean_*rel_err*, float for rmse_log__
     ws_sum = wb["summary_by_id"]
-    sum_headers = [c.value for c in ws_sum[1]]
-    sum_pct_cols = [
-        i + 1 for i, h in enumerate(sum_headers)
-        if isinstance(h, str) and (
-            h.startswith("abs_rel_err__")
-            or h.startswith("signed_rel_err__")
-            or h.startswith("avg_abs_rel_err__")
-            or h.startswith("avg_signed_rel_err__")
-            or h.startswith("avg_usage__")
-            or h in set(dummy_cols)
-        )
-    ]
-    _apply_percent_format(ws_sum, sum_pct_cols)
+    sum_hdr = _col_index_map(ws_sum)
+    pct_cols = [idx for h, idx in sum_hdr.items() if h.startswith("mean_abs_rel_err__") or h.startswith("mean_rel_err__") or h in set(dummy_cols) or h == "avg_usage__all_models"]
+    rmse_cols = [idx for h, idx in sum_hdr.items() if h.startswith("rmse_log__")]
 
-    # overall_method_diagnostics: percent cols for the error metrics + share_overestimate
-    ws_overall = wb["overall_method_diagnostics"]
-    overall_headers = [c.value for c in ws_overall[1]]
-    overall_pct_cols = []
-    for name in ["mean_abs_rel_err", "mean_signed_rel_err", "share_overestimate"]:
-        if name in overall_headers:
-            overall_pct_cols.append(overall_headers.index(name) + 1)
-    _apply_percent_format(ws_overall, overall_pct_cols)
+    _apply_percent_format(ws_sum, pct_cols)
+    _apply_float_format(ws_sum, rmse_cols)
 
-    # usage_overall: avg_usage as percent
-    ws_usage = wb["usage_overall"]
-    usage_headers = [c.value for c in ws_usage[1]]
-    if "avg_usage" in usage_headers:
-        _apply_percent_format(ws_usage, [usage_headers.index("avg_usage") + 1])
+    # summary_by_model: percent for mean_*rel_err, float for rmse_log
+    ws_m = wb["summary_by_model"]
+    m_hdr = _col_index_map(ws_m)
+    m_pct_cols = [m_hdr[c] for c in ["mean_abs_rel_err", "mean_rel_err"] if c in m_hdr]
+    m_float_cols = [m_hdr["rmse_log"]] if "rmse_log" in m_hdr else []
+    _apply_percent_format(ws_m, m_pct_cols)
+    _apply_float_format(ws_m, m_float_cols)
+
+    # usage_overall: percent avg_usage
+    ws_u = wb["usage_overall"]
+    u_hdr = _col_index_map(ws_u)
+    if "avg_usage" in u_hdr:
+        _apply_percent_format(ws_u, [u_hdr["avg_usage"]])
 
     wb.save(output_path)
 
     return output_path, {
-        "data_with_errors": out,
+        "data_with_errors": out_data,
         "summary_by_id": summary_by_id,
-        "overall_method_diagnostics": overall_method_diagnostics,
+        "summary_by_model": summary_by_model,
         "usage_overall": usage_overall,
     }
