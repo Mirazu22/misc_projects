@@ -1,0 +1,653 @@
+import warnings
+import numpy as np
+from scipy import sparse
+from scipy.sparse.linalg import lsqr
+
+# ============================================================
+# NUMERICAL CONSTANTS
+# ============================================================
+
+_EPS = 1e-12
+_DENSE_WARN_NCELLS = 50_000_000  # warn before materializing very large matrices
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def to_dense_array(M):
+    """
+    Convert scipy sparse or array-like input to a dense float NumPy array.
+
+    Notes
+    -----
+    This function materializes the full matrix in memory.
+    For very large sparse matrices, that can be expensive.
+    """
+    if sparse.issparse(M):
+        n_cells = M.shape[0] * M.shape[1]
+        if n_cells > _DENSE_WARN_NCELLS:
+            warnings.warn(
+                f"Converting a sparse matrix of shape {M.shape} to dense. "
+                f"This will allocate roughly {n_cells * 8 / 1e9:.2f} GB if float64."
+            )
+        return M.toarray().astype(float)
+    return np.asarray(M, dtype=float)
+
+
+def vectorize_offdiag(F, S):
+    """
+    Turn occupation x occupation matrices into dyad-level vectors,
+    keeping all directed off-diagonal pairs.
+
+    Parameters
+    ----------
+    F : array-like or sparse matrix
+        Raw directed flow matrix.
+    S : array-like or sparse matrix
+        Occupation similarity matrix.
+
+    Returns
+    -------
+    y : 1D ndarray
+        Raw flows F_ij for all directed off-diagonal pairs.
+    sim : 1D ndarray
+        Similarity values S_ij for the same directed pairs.
+    origin_ix : 1D ndarray
+        Origin occupation indices.
+    dest_ix : 1D ndarray
+        Destination occupation indices.
+    offdiag_mask : 2D boolean ndarray
+        Mask selecting off-diagonal entries.
+    """
+    F = to_dense_array(F)
+    S = to_dense_array(S)
+
+    if F.shape != S.shape:
+        raise ValueError(f"F and S must have the same shape; got {F.shape} and {S.shape}.")
+    if F.ndim != 2 or F.shape[0] != F.shape[1]:
+        raise ValueError(f"F must be square; got shape {F.shape}.")
+    if S.ndim != 2 or S.shape[0] != S.shape[1]:
+        raise ValueError(f"S must be square; got shape {S.shape}.")
+
+    n = F.shape[0]
+    offdiag_mask = ~np.eye(n, dtype=bool)
+    origin_ix, dest_ix = np.where(offdiag_mask)
+
+    y = F[origin_ix, dest_ix].astype(float)
+    sim = S[origin_ix, dest_ix].astype(float)
+
+    return y, sim, origin_ix, dest_ix, offdiag_mask
+
+
+def margins_expected_flow(F, exclude_diagonal=True):
+    """
+    Build the standard margins-only benchmark for a flow table.
+
+    Let:
+        O_i = total outflow from origin i
+        D_j = total inflow to destination j
+        T   = total flow in the whole system
+
+    Then the expected flow under independence of margins is:
+        E0_ij = O_i * D_j / T
+
+    Parameters
+    ----------
+    F : array-like or sparse matrix
+        Raw directed flow matrix.
+    exclude_diagonal : bool, default True
+        If True, diagonal entries are excluded from the margins benchmark.
+        This aligns the benchmark with the off-diagonal PPML models below.
+
+    Returns
+    -------
+    E0 : 2D ndarray
+        Expected flow matrix under the margins-only benchmark.
+    O : 1D ndarray
+        Origin totals used in the benchmark.
+    D : 1D ndarray
+        Destination totals used in the benchmark.
+    T : float
+        Grand total flow used in the benchmark.
+    """
+    F = to_dense_array(F)
+
+    if F.ndim != 2 or F.shape[0] != F.shape[1]:
+        raise ValueError(f"F must be square; got shape {F.shape}.")
+    if np.any(F < 0):
+        raise ValueError("F contains negative flows, which are not allowed.")
+
+    F_work = F.copy()
+
+    if exclude_diagonal:
+        diag = np.diag(F_work)
+        if np.any(diag != 0):
+            warnings.warn(
+                "F has non-zero diagonal entries. The margins benchmark will exclude self-flows "
+                "to align with the off-diagonal PPML models."
+            )
+        np.fill_diagonal(F_work, 0.0)
+
+    O = F_work.sum(axis=1)
+    D = F_work.sum(axis=0)
+    T = float(F_work.sum())
+
+    if T <= 0:
+        raise ValueError("Total off-diagonal flow is zero; cannot build margins benchmark.")
+
+    E0 = np.outer(O, D) / T
+    return E0, O, D, T
+
+
+def build_design_matrix(origin_ix, dest_ix, sim=None, n_occ=None, include_similarity=True):
+    """
+    Build a sparse dyad-level design matrix for PPML.
+
+    Column order
+    ------------
+    0 : intercept
+    1 : similarity regressor (only if include_similarity=True)
+    next n_occ - 1 columns : origin fixed effects for occupations 0, ..., n_occ - 2
+                             (occupation n_occ - 1 is the omitted reference category)
+    final n_occ - 1 columns : destination fixed effects for occupations 0, ..., n_occ - 2
+                              (occupation n_occ - 1 is the omitted reference category)
+
+    Parameters
+    ----------
+    origin_ix : 1D ndarray
+        Origin occupation index for each dyad.
+    dest_ix : 1D ndarray
+        Destination occupation index for each dyad.
+    sim : 1D ndarray, optional
+        Similarity regressor aligned with the dyads.
+    n_occ : int, optional
+        Number of occupations. Pass explicitly when possible.
+    include_similarity : bool, default True
+        Whether to include the similarity regressor.
+
+    Returns
+    -------
+    X : scipy.sparse.csr_matrix
+        Sparse design matrix.
+    """
+    if n_occ is None:
+        warnings.warn("n_occ inferred from data. Pass it explicitly to be safe.")
+        n_occ = max(origin_ix.max(), dest_ix.max()) + 1
+
+    m = len(origin_ix)
+    row_ix = np.arange(m)
+
+    pieces = []
+
+    # Intercept column as sparse directly
+    intercept = sparse.csr_matrix(
+        (np.ones(m), (row_ix, np.zeros(m, dtype=int))),
+        shape=(m, 1)
+    )
+    pieces.append(intercept)
+
+    # Optional similarity regressor
+    if include_similarity:
+        if sim is None:
+            raise ValueError("sim must be provided when include_similarity=True.")
+        sim_col = sparse.csr_matrix(np.asarray(sim, dtype=float).reshape(-1, 1))
+        pieces.append(sim_col)
+
+    # Origin fixed effects (last occupation omitted as reference)
+    keep_origin = origin_ix < (n_occ - 1)
+    origin_dummies = sparse.csr_matrix(
+        (np.ones(keep_origin.sum()), (row_ix[keep_origin], origin_ix[keep_origin])),
+        shape=(m, n_occ - 1)
+    )
+    pieces.append(origin_dummies)
+
+    # Destination fixed effects (last occupation omitted as reference)
+    keep_dest = dest_ix < (n_occ - 1)
+    dest_dummies = sparse.csr_matrix(
+        (np.ones(keep_dest.sum()), (row_ix[keep_dest], dest_ix[keep_dest])),
+        shape=(m, n_occ - 1)
+    )
+    pieces.append(dest_dummies)
+
+    return sparse.hstack(pieces, format="csr")
+
+
+def poisson_deviance(y, mu):
+    """
+    Compute Poisson deviance.
+
+    For y > 0:
+        2 * [ y * log(y / mu) - (y - mu) ]
+
+    For y = 0:
+        2 * mu
+
+    Parameters
+    ----------
+    y : 1D ndarray
+        Observed nonnegative counts.
+    mu : 1D ndarray
+        Fitted positive means.
+
+    Returns
+    -------
+    deviance : float
+        Total Poisson deviance.
+    """
+    y = np.asarray(y, dtype=float)
+    mu = np.asarray(mu, dtype=float)
+
+    if np.any(y < 0):
+        raise ValueError("Poisson deviance is only defined for nonnegative y.")
+
+    mu = np.clip(mu, _EPS, None)
+
+    term = np.empty_like(y, dtype=float)
+    pos = y > 0
+
+    term[pos] = y[pos] * np.log(y[pos] / mu[pos]) - (y[pos] - mu[pos])
+    term[~pos] = mu[~pos]
+
+    return 2.0 * term.sum()
+
+
+def pseudo_r2(y, mu):
+    """
+    Compute a McFadden-style pseudo-R² based on the Poisson log-likelihood:
+
+        pseudo_R2 = 1 - ll_model / ll_null
+
+    where the null model uses only an intercept.
+
+    Parameters
+    ----------
+    y : 1D ndarray
+        Observed nonnegative counts.
+    mu : 1D ndarray
+        Fitted positive means.
+
+    Returns
+    -------
+    value : float
+        Pseudo-R², or NaN if the null likelihood is degenerate.
+    """
+    y = np.asarray(y, dtype=float)
+    mu = np.asarray(mu, dtype=float)
+
+    if np.any(y < 0):
+        raise ValueError("Pseudo-R² is only defined for nonnegative y.")
+
+    mu = np.clip(mu, _EPS, None)
+    y_mean = float(y.mean())
+
+    if y_mean <= 0:
+        warnings.warn("Mean of y is nonpositive; pseudo-R² is undefined.")
+        return float("nan")
+
+    ll_model = np.sum(y * np.log(mu) - mu)
+
+    mu_null = np.full_like(y, y_mean)
+    mu_null = np.clip(mu_null, _EPS, None)
+    ll_null = np.sum(y * np.log(mu_null) - mu_null)
+
+    if np.isclose(ll_null, 0.0):
+        warnings.warn("Null log-likelihood is numerically zero; pseudo-R² is undefined.")
+        return float("nan")
+
+    return 1.0 - (ll_model / ll_null)
+
+
+def fit_ppml_irls(X, y, beta_start=None, max_iter=100, tol=1e-8, verbose=True):
+    """
+    Fit PPML using IRLS.
+
+    Mean model
+    ----------
+        E[y | X] = exp(X beta)
+
+    IRLS update
+    -----------
+        eta = X beta
+        mu  = exp(eta)
+        z   = eta + (y - mu) / mu
+
+    Then solve the weighted least-squares problem:
+        min || sqrt(mu) * (z - X beta_new) ||^2
+
+    Parameters
+    ----------
+    X : scipy.sparse.csr_matrix
+        Design matrix.
+    y : 1D ndarray
+        Observed nonnegative flows.
+    beta_start : 1D ndarray, optional
+        Starting values for coefficients.
+    max_iter : int, default 100
+        Maximum number of IRLS iterations.
+    tol : float, default 1e-8
+        Relative deviance tolerance for convergence.
+    verbose : bool, default True
+        Whether to print iteration progress.
+
+    Returns
+    -------
+    result : dict
+        Keys:
+            beta : fitted coefficient vector
+            mu : fitted means
+            deviance : final Poisson deviance
+            iterations : number of IRLS iterations run
+            converged : whether the algorithm met the tolerance criterion
+            rel_change : final relative deviance change
+    """
+    y = np.asarray(y, dtype=float)
+
+    if np.any(y < 0):
+        raise ValueError("PPML requires nonnegative dependent variables.")
+
+    n_obs, n_params = X.shape
+
+    if beta_start is None:
+        beta = np.zeros(n_params)
+        beta[0] = np.log(max(y.mean(), _EPS))
+    else:
+        beta = np.asarray(beta_start, dtype=float).copy()
+
+    dev_old = None
+    converged = False
+    rel_change = np.nan
+
+    for it in range(1, max_iter + 1):
+        eta = X @ beta
+        eta = np.clip(eta, -20, 20)
+
+        mu = np.exp(eta)
+        mu = np.clip(mu, _EPS, 1e12)
+
+        z = eta + (y - mu) / mu
+
+        # Sparse row scaling for weighted least squares
+        sqrt_w = np.sqrt(mu)
+        WX = X.multiply(sqrt_w[:, None])
+        wz = z * sqrt_w
+
+        beta_new = lsqr(WX, wz, atol=1e-10, btol=1e-10, iter_lim=20000)[0]
+
+        eta_new = X @ beta_new
+        eta_new = np.clip(eta_new, -20, 20)
+
+        mu_new = np.exp(eta_new)
+        mu_new = np.clip(mu_new, _EPS, 1e12)
+
+        dev_new = poisson_deviance(y, mu_new)
+
+        if dev_old is None:
+            rel_change = np.nan
+            if verbose:
+                print(f"  IRLS iter {it:>2}: deviance = {dev_new:,.4f}, relative change = n/a")
+        else:
+            rel_change = abs(dev_old - dev_new) / max(abs(dev_old), 1.0)
+            if verbose:
+                print(f"  IRLS iter {it:>2}: deviance = {dev_new:,.4f}, relative change = {rel_change:.3e}")
+            if rel_change < tol:
+                converged = True
+                beta = beta_new
+                break
+
+        beta = beta_new
+        dev_old = dev_new
+
+    if not converged and dev_old is not None:
+        warnings.warn(
+            f"IRLS did not converge within {max_iter} iterations. "
+            f"Final relative deviance change = {rel_change:.3e}."
+        )
+
+    # Ensure final fitted values correspond to final beta
+    eta_final = X @ beta
+    eta_final = np.clip(eta_final, -20, 20)
+    mu_final = np.exp(eta_final)
+    mu_final = np.clip(mu_final, _EPS, 1e12)
+    dev_final = poisson_deviance(y, mu_final)
+
+    return {
+        "beta": beta,
+        "mu": mu_final,
+        "deviance": dev_final,
+        "iterations": it,
+        "converged": converged,
+        "rel_change": rel_change,
+    }
+
+
+def summarize_ppml_result(name, result, y, include_similarity=True):
+    """
+    Print a clean summary of a fitted PPML model.
+    """
+    beta = result["beta"]
+    mu = result["mu"]
+
+    print("\n" + "=" * 72)
+    print(f"MODEL SUMMARY: {name}")
+    print("=" * 72)
+
+    print(f"Number of dyads used: {len(y):,}")
+    print(f"Number of IRLS iterations: {result['iterations']}")
+    print(f"Converged: {result['converged']}")
+    if np.isfinite(result["rel_change"]):
+        print(f"Final relative deviance change: {result['rel_change']:.3e}")
+    else:
+        print("Final relative deviance change: n/a")
+    print(f"Poisson deviance: {result['deviance']:,.4f}")
+    print(f"Pseudo-R² (vs intercept-only null): {pseudo_r2(y, mu):.6f}")
+
+    print("\nMain coefficients:")
+    print(f"  Intercept: {beta[0]:.6f}")
+
+    if include_similarity:
+        beta_sim = beta[1]
+        mult_01 = np.exp(0.1 * beta_sim)
+        print(f"  Similarity coefficient beta: {beta_sim:.6f}")
+        print(f"  Multiplicative effect of +0.1 similarity on expected flow: {mult_01:.6f}")
+    else:
+        print("  No similarity term in this model (margins-only benchmark).")
+
+
+# ============================================================
+# MAIN DRIVER
+# ============================================================
+
+def run_skill_flow_analysis(F, S, verbose=True):
+    """
+    Run the full workflow:
+
+    1. Build a margins-only expected-flow benchmark.
+    2. Compute an excess-flow diagnostic.
+    3. Fit a PPML model with origin and destination fixed effects only.
+    4. Fit a PPML model that adds skill similarity.
+    5. Compare model fit.
+
+    Parameters
+    ----------
+    F : array-like or sparse matrix
+        Raw directed occupation-to-occupation flow matrix.
+    S : array-like or sparse matrix
+        Occupation similarity matrix of the same shape as F.
+    verbose : bool, default True
+        Whether to print IRLS iteration progress.
+
+    Returns
+    -------
+    results : dict
+        Dictionary containing benchmarks, diagnostics, fitted models, and fitted matrices.
+    """
+    F = to_dense_array(F)
+    S = to_dense_array(S)
+
+    if F.shape != S.shape:
+        raise ValueError(f"F and S must have the same shape; got {F.shape} and {S.shape}.")
+    if F.ndim != 2 or F.shape[0] != F.shape[1]:
+        raise ValueError(f"F must be square; got shape {F.shape}.")
+    if S.ndim != 2 or S.shape[0] != S.shape[1]:
+        raise ValueError(f"S must be square; got shape {S.shape}.")
+    if np.any(F < 0):
+        raise ValueError("F contains negative flows, which are not allowed.")
+
+    n = F.shape[0]
+    offdiag_mask = ~np.eye(n, dtype=bool)
+
+    # --------------------------------------------------------
+    # Step 1: margins-only benchmark
+    # --------------------------------------------------------
+    E0, origin_totals, destination_totals, total_flow = margins_expected_flow(
+        F, exclude_diagonal=True
+    )
+
+    print("=" * 72)
+    print("STEP 1: MARGINS-ONLY BENCHMARK")
+    print("=" * 72)
+    print("This benchmark asks:")
+    print("  What flows would we expect if mobility were driven only by")
+    print("  origin outflow size and destination inflow size?")
+    print("")
+    print("Benchmark details:")
+    print("  - diagonal/self-flows are excluded")
+    print("  - expected flow formula is E0_ij = O_i * D_j / T")
+    print("")
+    print(f"Total off-diagonal flow T: {total_flow:,.0f}")
+    print(f"Mean origin outflow: {origin_totals.mean():,.2f}")
+    print(f"Mean destination inflow: {destination_totals.mean():,.2f}")
+    print(f"Largest origin outflow: {origin_totals.max():,.0f}")
+    print(f"Largest destination inflow: {destination_totals.max():,.0f}")
+
+    # --------------------------------------------------------
+    # Step 2: excess-flow diagnostic
+    # --------------------------------------------------------
+    excess_log_flow = np.full_like(F, np.nan, dtype=float)
+    excess_log_flow[offdiag_mask] = np.log(
+        (F[offdiag_mask] + _EPS) / (E0[offdiag_mask] + _EPS)
+    )
+
+    offdiag_excess = excess_log_flow[offdiag_mask]
+
+    print("\n" + "=" * 72)
+    print("STEP 2: EXCESS-FLOW DIAGNOSTIC")
+    print("=" * 72)
+    print("Diagnostic quantity:")
+    print("  log( observed flow / expected flow under margins-only benchmark )")
+    print("")
+    print("Interpretation:")
+    print("  > 0 : more flow than margins alone would predict")
+    print("  = 0 : exactly in line with margins")
+    print("  < 0 : less flow than margins alone would predict")
+    print("")
+    print("Off-diagonal summary:")
+    print(f"  Mean excess-log-flow: {np.nanmean(offdiag_excess):.6f}")
+    print(f"  Std. dev. of excess-log-flow: {np.nanstd(offdiag_excess):.6f}")
+
+    # --------------------------------------------------------
+    # Step 3: prepare dyads
+    # --------------------------------------------------------
+    y, sim, origin_ix, dest_ix, offdiag_mask_check = vectorize_offdiag(F, S)
+
+    print("\n" + "=" * 72)
+    print("STEP 3: PREPARE DIRECTED OCCUPATION PAIRS")
+    print("=" * 72)
+    print("We keep all directed off-diagonal pairs i -> j.")
+    print(f"Number of occupations: {n}")
+    print(f"Number of directed off-diagonal dyads: {len(y):,}")
+    print(f"Number of zero-flow dyads: {(y == 0).sum():,}")
+    print(f"Share of zero-flow dyads: {(y == 0).mean():.3f}")
+
+    # --------------------------------------------------------
+    # Step 4: margins-only PPML
+    # --------------------------------------------------------
+    print("\n" + "=" * 72)
+    print("STEP 4: FIT PPML MODEL 0 (MARGINS ONLY)")
+    print("=" * 72)
+    print("Mean model:")
+    print("  E[F_ij] = exp(alpha_i + delta_j)")
+    print("This asks whether origin and destination margins alone explain flows.")
+
+    X0 = build_design_matrix(
+        origin_ix=origin_ix,
+        dest_ix=dest_ix,
+        sim=None,
+        n_occ=n,
+        include_similarity=False,
+    )
+
+    res0 = fit_ppml_irls(X0, y, beta_start=None, verbose=verbose)
+    summarize_ppml_result("PPML Model 0: margins only", res0, y, include_similarity=False)
+
+    # --------------------------------------------------------
+    # Step 5: margins + similarity PPML
+    # --------------------------------------------------------
+    print("\n" + "=" * 72)
+    print("STEP 5: FIT PPML MODEL 1 (MARGINS + SIMILARITY)")
+    print("=" * 72)
+    print("Mean model:")
+    print("  E[F_ij] = exp(alpha_i + delta_j + beta * similarity_ij)")
+    print("This asks whether similarity explains excess flow beyond margins.")
+
+    X1 = build_design_matrix(
+        origin_ix=origin_ix,
+        dest_ix=dest_ix,
+        sim=sim,
+        n_occ=n,
+        include_similarity=True,
+    )
+
+    # Warm-start from Model 0:
+    # Model 0 columns are [intercept, origin FE, destination FE]
+    # Model 1 columns are [intercept, similarity, origin FE, destination FE]
+    beta_start_1 = np.zeros(X1.shape[1])
+    beta_start_1[0] = res0["beta"][0]
+    beta_start_1[2:] = res0["beta"][1:]
+
+    res1 = fit_ppml_irls(X1, y, beta_start=beta_start_1, verbose=verbose)
+    summarize_ppml_result("PPML Model 1: margins + similarity", res1, y, include_similarity=True)
+
+    # --------------------------------------------------------
+    # Step 6: compare fit
+    # --------------------------------------------------------
+    print("\n" + "=" * 72)
+    print("STEP 6: MODEL COMPARISON")
+    print("=" * 72)
+
+    pr2_0 = pseudo_r2(y, res0["mu"])
+    pr2_1 = pseudo_r2(y, res1["mu"])
+
+    print("Pseudo-R² comparison:")
+    print(f"  Model 0 (margins only):         {pr2_0:.6f}")
+    print(f"  Model 1 (margins + similarity): {pr2_1:.6f}")
+    print(f"  Gain from adding similarity:    {pr2_1 - pr2_0:.6f}")
+    print("")
+    print("Interpretation:")
+    print("  This gain is the extra explanatory power of similarity after")
+    print("  accounting for origin outflow intensity and destination attractiveness.")
+
+    # Reconstruct fitted matrices for inspection
+    fitted0 = np.full_like(F, np.nan, dtype=float)
+    fitted1 = np.full_like(F, np.nan, dtype=float)
+    fitted0[offdiag_mask_check] = res0["mu"]
+    fitted1[offdiag_mask_check] = res1["mu"]
+
+    return {
+        "E0_margins_only": E0,
+        "excess_log_flow": excess_log_flow,
+        "origin_totals": origin_totals,
+        "destination_totals": destination_totals,
+        "ppml_model_0": res0,
+        "ppml_model_1": res1,
+        "fitted_model_0": fitted0,
+        "fitted_model_1": fitted1,
+    }
+
+
+# ============================================================
+# EXAMPLE USAGE
+# ============================================================
+# results_tfidf = run_skill_flow_analysis(F, S_tfidf, verbose=True)
+# results_gamma = run_skill_flow_analysis(F, S_gamma, verbose=True)
