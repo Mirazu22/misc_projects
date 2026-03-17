@@ -1,0 +1,105 @@
+import numpy as np
+import pandas as pd
+from scipy import sparse, stats
+
+# ------------------------------------------------------------
+# INPUTS you already have:
+#   P       : (n_occ x n_occ) matrix of transition probabilities
+#   S_tfidf : (n_occ x n_occ) similarity matrix
+#   S_gamma : (n_occ x n_occ) similarity matrix
+# ------------------------------------------------------------
+
+def _to_offdiag_vector(M):
+    """Return all off-diagonal entries as a 1D float array."""
+    if sparse.issparse(M):
+        A = M.toarray()
+    else:
+        A = np.asarray(M)
+    mask = ~np.eye(A.shape[0], dtype=bool)
+    return A[mask].astype(float)
+
+def simple_ols(y, x):
+    """OLS with intercept; returns coefficients, fitted values, residuals, R^2."""
+    X = np.column_stack([np.ones_like(x), x])
+    beta, *_ = np.linalg.lstsq(X, y, rcond=None)
+    yhat = X @ beta
+    resid = y - yhat
+    ss_res = np.sum(resid**2)
+    ss_tot = np.sum((y - y.mean())**2)
+    r2 = 1 - ss_res / ss_tot
+    return beta, yhat, resid, r2
+
+def corr_by_quantile(y, x, q=10):
+    bins = pd.qcut(x, q=q, labels=False, duplicates="drop")
+    out = []
+    for b in np.sort(pd.unique(bins)):
+        idx = (bins == b)
+        if idx.sum() < 10:
+            continue
+        out.append({
+            "bin": int(b),
+            "n": int(idx.sum()),
+            "pearson": float(np.corrcoef(y[idx], x[idx])[0, 1]) if np.std(x[idx]) > 0 and np.std(y[idx]) > 0 else np.nan,
+            "spearman": float(stats.spearmanr(y[idx], x[idx]).correlation),
+            "mean_logP": float(np.mean(y[idx])),
+            "mean_sim": float(np.mean(x[idx])),
+        })
+    return pd.DataFrame(out)
+
+# ------------------------------------------------------------
+# 1) Vectorize
+# ------------------------------------------------------------
+p = _to_offdiag_vector(P)
+x_tfidf = _to_offdiag_vector(S_tfidf)
+x_gamma = _to_offdiag_vector(S_gamma)
+
+# ------------------------------------------------------------
+# 2) Keep only strictly positive transition probabilities
+#    because log(0) is undefined
+# ------------------------------------------------------------
+mask = np.isfinite(p) & np.isfinite(x_tfidf) & np.isfinite(x_gamma) & (p > 0)
+p = p[mask]
+x_tfidf = x_tfidf[mask]
+x_gamma = x_gamma[mask]
+
+y = np.log(p)
+
+# ------------------------------------------------------------
+# 3) Separate regressions: log(P_ij) on similarity
+# ------------------------------------------------------------
+b_tfidf, yhat_tfidf, resid_tfidf, r2_tfidf = simple_ols(y, x_tfidf)
+b_gamma, yhat_gamma, resid_gamma, r2_gamma = simple_ols(y, x_gamma)
+
+# ------------------------------------------------------------
+# 4) Spearman rank correlations
+# ------------------------------------------------------------
+spr_tfidf = stats.spearmanr(y, x_tfidf).correlation
+spr_gamma = stats.spearmanr(y, x_gamma).correlation
+
+# ------------------------------------------------------------
+# 5) Quantile checks
+# ------------------------------------------------------------
+q_tfidf = corr_by_quantile(y, x_tfidf, q=10)
+q_gamma = corr_by_quantile(y, x_gamma, q=10)
+
+# ------------------------------------------------------------
+# 6) Print results
+# ------------------------------------------------------------
+print("Regression results: log(transition probability) on similarity\n")
+
+print("TFIDF + cosine:")
+print(f"  intercept   = {b_tfidf[0]:.6f}")
+print(f"  slope       = {b_tfidf[1]:.6f}")
+print(f"  R-squared   = {r2_tfidf:.6f}")
+print(f"  Spearman    = {spr_tfidf:.6f}\n")
+
+print("Rarity-weighted gamma:")
+print(f"  intercept   = {b_gamma[0]:.6f}")
+print(f"  slope       = {b_gamma[1]:.6f}")
+print(f"  R-squared   = {r2_gamma:.6f}")
+print(f"  Spearman    = {spr_gamma:.6f}\n")
+
+print("Quantile-by-quantile correlations for TFIDF:")
+print(q_tfidf.to_string(index=False))
+print("\nQuantile-by-quantile correlations for GAMMA:")
+print(q_gamma.to_string(index=False))
